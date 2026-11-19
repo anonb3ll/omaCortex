@@ -62,3 +62,31 @@ test("rows are bounded and markup-shaped text passes through as plain data", () 
   assert.equal(Model.totalFocus(data), 150)
   assert.match(Model.tooltip(data, NOW), /Chromium for 1m/)
 })
+
+test("pages show their title and site", () => {
+  const data = base({}, { pages: [{ started_at: NOW, seconds: 840, title: "Why small models win", app: "writer.substack.com" }] })
+  assert.deepEqual(Model.pageRows(data), [
+    { time: Model.clock(NOW), length: "14m", title: "Why small models win", source: "writer.substack.com" }
+  ])
+  assert.deepEqual(Model.pageRows(base({})), [])
+})
+
+test("the resume card shows only around a break", () => {
+  const before_break = {
+    away_at: NOW - 3000,
+    back_at: NOW - 600,
+    away_seconds: 2400,
+    sessions: [{ app: "com.mitchellh.ghostty", title: "nvim auth.rs", started_at: NOW - 4000, active_seconds: 900 }]
+  }
+  const card = Model.resume(base({}, { before_break }), NOW)
+  assert.equal(card.away, "40m")
+  assert.deepEqual(card.rows, [{ time: Model.clock(NOW - 4000), length: "15m", app: "Ghostty", title: "nvim auth.rs" }])
+  // Half an hour after coming back it is old news.
+  assert.equal(Model.resume(base({}, { before_break }), NOW + 1300), null)
+  // Still away: shown, with no length yet.
+  const away = Object.assign({}, before_break, { back_at: null, away_seconds: null })
+  assert.equal(Model.resume(base({ away: true }, { before_break: away }), NOW).away, "")
+  assert.equal(Model.resume(base({}, { before_break: away }), NOW), null)
+  assert.equal(Model.resume(base({}), NOW), null)
+  assert.equal(Model.resume(base({ consent: false }, { before_break }), NOW), null)
+})

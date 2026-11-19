@@ -56,6 +56,34 @@ fn strip_url(raw: &str) -> String {
     format!("{scheme}://{host}{}", &after[..path_end])
 }
 
+/// The host of an http(s) address, lower-cased, without credentials or port.
+pub fn host_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if host.starts_with('[') {
+        host.split_once(']').map_or(host, |(h, _)| h)
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches('.')
+        .to_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// A path segment that looks like an identifier or secret rather than words:
+/// a long unbroken run, as in a share link or a session path.
+fn opaque_segment(segment: &str) -> bool {
+    segment.split(['-', '_', '.', '~', '+']).any(|piece| {
+        piece.chars().count() >= 24 && piece.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 /// Case-insensitive glob with `*` and `?`.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.to_lowercase().chars().collect();
@@ -117,6 +145,9 @@ pub struct Privacy {
     pub bad_patterns: Vec<String>,
     exclude_workspaces: HashSet<String>,
     exclude_paths: Vec<PathBuf>,
+    exclude_hosts: Vec<String>,
+    /// (host suffix, parameter) pairs that survive [`Privacy::clean_url`].
+    keep_url_params: Vec<(String, String)>,
 }
 
 impl Privacy {
@@ -154,7 +185,25 @@ impl Privacy {
                 .filter(|p| !p.is_empty())
                 .map(|p| real(&expand_home(p)))
                 .collect(),
+            exclude_hosts: Vec::new(),
+            keep_url_params: Vec::new(),
         }
+    }
+
+    /// Rules for web pages: hosts never recorded and the query parameters kept.
+    pub fn with_web(mut self, exclude_hosts: &[String], keep_url_params: &[String]) -> Self {
+        self.exclude_hosts = exclude_hosts
+            .iter()
+            .filter(|h| !h.is_empty())
+            .map(|h| h.to_lowercase())
+            .collect();
+        self.keep_url_params = keep_url_params
+            .iter()
+            .filter_map(|rule| rule.split_once(':'))
+            .filter(|(h, p)| !h.is_empty() && !p.is_empty())
+            .map(|(h, p)| (h.to_lowercase(), p.to_string()))
+            .collect();
+        self
     }
 
     pub fn from_settings(p: &config::Privacy) -> Self {
@@ -165,6 +214,76 @@ impl Privacy {
             &p.exclude_workspaces,
             &p.exclude_paths,
         )
+        .with_web(&p.exclude_hosts, &p.keep_url_params)
+    }
+
+    pub fn host_excluded(&self, host: &str) -> bool {
+        let host = host.to_lowercase();
+        let bare = host.strip_prefix("www.").unwrap_or(&host);
+        self.exclude_hosts
+            .iter()
+            .any(|p| glob_match(p, &host) || glob_match(p, bare))
+    }
+
+    /// A page address safe to store: http(s) only, no credentials, no
+    /// fragment, and no query string apart from the parameters listed in
+    /// `keep_url_params` for that host. Path segments that look like tokens
+    /// are replaced. Returns None for anything that is not a web page.
+    pub fn clean_url(&self, raw: &str) -> Option<String> {
+        let raw = bounded(raw, 2000);
+        let host = host_of(&raw)?;
+        let (scheme, rest) = raw.split_once("://")?;
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        // Keep the port: localhost:3000 and localhost:8080 are different places.
+        let authority = rest[..authority_end]
+            .rsplit_once('@')
+            .map_or(&rest[..authority_end], |(_, h)| h)
+            .to_lowercase();
+        let after = &rest[authority_end..];
+        let path_end = after.find(['?', '#']).unwrap_or(after.len());
+        let query = after[path_end..]
+            .strip_prefix('?')
+            .map(|q| &q[..q.find('#').unwrap_or(q.len())])
+            .unwrap_or("");
+        let path: Vec<String> = after[..path_end]
+            .split('/')
+            .map(|seg| {
+                if self.redact && opaque_segment(seg) {
+                    "[redacted]".to_string()
+                } else {
+                    seg.to_string()
+                }
+            })
+            .collect();
+        let bare = host.strip_prefix("www.").unwrap_or(&host);
+        let kept: Vec<String> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .filter(|(name, value)| {
+                !value.is_empty()
+                    && value.len() <= 64
+                    && self
+                        .keep_url_params
+                        .iter()
+                        .any(|(h, p)| p == name && (bare == h || bare.ends_with(&format!(".{h}"))))
+            })
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        let mut out = format!(
+            "{}://{authority}{}",
+            scheme.to_ascii_lowercase(),
+            path.join("/")
+        );
+        if !kept.is_empty() {
+            out.push('?');
+            out.push_str(&kept.join("&"));
+        }
+        if self.redact {
+            out = EMAIL
+                .replace_all(&out.replace("%40", "@"), "[email]")
+                .into_owned();
+        }
+        Some(bounded(&out, MAX_TEXT))
     }
 
     pub fn app_excluded(&self, app: &str) -> bool {
@@ -294,6 +413,80 @@ mod tests {
         );
         assert_eq!(p.bad_patterns, vec!["(unclosed".to_string()]);
         assert!(p.title_excluded("my SECRET doc"));
+    }
+
+    #[test]
+    fn page_addresses_lose_queries_tokens_and_credentials() {
+        let p = Privacy::from_settings(&config::Privacy::default());
+        assert_eq!(
+            p.clean_url("https://user:pw@Example.com:8443/a/b?utm=1&q=secret#frag")
+                .as_deref(),
+            Some("https://example.com:8443/a/b")
+        );
+        // The video id is what makes a YouTube address worth keeping.
+        assert_eq!(
+            p.clean_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s&list=PLx")
+                .as_deref(),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+        assert_eq!(
+            p.clean_url("https://evil.example/watch?v=dQw4w9WgXcQ")
+                .as_deref(),
+            Some("https://evil.example/watch")
+        );
+        // Long slugs made of words survive; opaque identifiers do not.
+        let slug =
+            "https://writer.substack.com/p/why-small-models-will-win-the-next-decade-of-computing";
+        assert_eq!(p.clean_url(slug).as_deref(), Some(slug));
+        assert_eq!(
+            p.clean_url("https://files.example/share/9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c/report")
+                .as_deref(),
+            Some("https://files.example/share/[redacted]/report")
+        );
+        assert_eq!(
+            p.clean_url("https://mail.example/u/someone%40example.com/inbox")
+                .as_deref(),
+            Some("https://mail.example/u/[email]/inbox")
+        );
+        for not_a_page in [
+            "chrome://settings",
+            "file:///home/u/x.html",
+            "about:blank",
+            "notaurl",
+            "",
+        ] {
+            assert_eq!(p.clean_url(not_a_page), None);
+        }
+    }
+
+    #[test]
+    fn sensitive_hosts_are_excluded() {
+        let p = Privacy::from_settings(&config::Privacy::default());
+        for host in [
+            "accounts.google.com",
+            "login.microsoftonline.com",
+            "www.chase.bank",
+            "www.bankofamerica.com",
+            "www.paypal.com",
+            "vault.bitwarden.com",
+            "dev-1234.okta.com",
+        ] {
+            assert!(p.host_excluded(host), "{host}");
+        }
+        for host in [
+            "www.youtube.com",
+            "news.ycombinator.com",
+            "writer.substack.com",
+            "github.com",
+        ] {
+            assert!(!p.host_excluded(host), "{host}");
+        }
+        assert_eq!(
+            host_of("https://User@Sub.Example.com:8080/x").as_deref(),
+            Some("sub.example.com")
+        );
+        assert_eq!(host_of("http://[::1]:3000/").as_deref(), Some("::1"));
+        assert_eq!(host_of("ftp://example.com/"), None);
     }
 
     #[test]

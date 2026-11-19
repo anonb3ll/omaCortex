@@ -5,6 +5,10 @@
 //! whose `ended_at` equals `started_at`. A span still in progress has
 //! `ended_at` NULL; readers treat it as ending now. The schema is the same one
 //! the 0.1 Python recorder wrote, so existing databases keep working.
+//!
+//! A page visit reported by a browser is a span too. Its `meta` column holds
+//! the address, site, author and content type as JSON; the other kinds leave
+//! `meta` empty.
 
 use crate::timeutil::Clock;
 use rusqlite::types::Value as SqlValue;
@@ -16,7 +20,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Mutex;
 
-pub const KINDS: [&str; 5] = ["focus", "media", "file", "note", "marker"];
+pub const KINDS: [&str; 6] = ["focus", "media", "page", "file", "note", "marker"];
+/// Kinds that expire with `retention_days`. Everything else is the library
+/// (what you watched, read, opened and noted) and follows `library_days`.
+const HISTORY_KINDS: &str = "('focus','marker')";
 const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = r#"
@@ -82,6 +89,42 @@ pub struct Row {
     pub seconds: f64,
 }
 
+/// One distinct thing (a video, an article, a track, a file, a window title)
+/// with every time it was seen folded together.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Item {
+    pub kind: String,
+    pub title: String,
+    /// Window class, media player, or web host.
+    pub app: String,
+    pub site: String,
+    /// Artist, channel or author, when known.
+    pub creator: String,
+    /// Web address or file path, when there is one.
+    pub location: String,
+    /// "video", "article" or "page" for web pages; empty otherwise.
+    pub content: String,
+    pub first_seen: f64,
+    pub last_seen: f64,
+    pub seconds: f64,
+    pub times: i64,
+    /// Row id of the latest sighting, for `omacortex around --id`.
+    pub last_id: i64,
+}
+
+/// A page visit as the browser reported it, already cleaned by the privacy guard.
+pub struct PageVisit<'a> {
+    pub source: &'a str,
+    pub host: &'a str,
+    pub title: &'a str,
+    pub url: &'a str,
+    pub site: &'a str,
+    pub author: &'a str,
+    pub content: &'a str,
+    pub at: f64,
+    pub seconds: f64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Usage {
     pub app: String,
@@ -126,6 +169,45 @@ pub fn fts_query(text: &str) -> String {
         .map(|w| format!("\"{w}\"*"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Free text to substring patterns for LIKE: every word must appear somewhere.
+fn like_patterns(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .take(8)
+        .map(|w| {
+            let escaped: String = w
+                .chars()
+                .flat_map(|c| match c {
+                    '%' | '_' | '\\' => vec!['\\', c],
+                    c => vec![c],
+                })
+                .collect();
+            format!("%{escaped}%")
+        })
+        .collect()
+}
+
+/// How a text query was satisfied, most exact first.
+pub const MATCH_ALL: &str = "all-words";
+pub const MATCH_SUBSTRING: &str = "substring";
+pub const MATCH_ANY: &str = "any-word";
+
+/// Split a media or file row's detail into (creator, location).
+fn split_detail(kind: &str, detail: &str) -> (String, String) {
+    if kind == "file" {
+        return (String::new(), detail.to_string());
+    }
+    let (mut creator, mut location) = (Vec::new(), String::new());
+    for part in detail.split(" · ") {
+        if part.contains("://") {
+            location = part.to_string();
+        } else if !part.is_empty() {
+            creator.push(part);
+        }
+    }
+    (creator.join(" · "), location)
 }
 
 fn valid_kinds(kinds: &[String]) -> Vec<String> {
@@ -206,6 +288,46 @@ impl Store {
             params![kind, source, app, title, detail, at, end],
         )?;
         Ok(db.last_insert_rowid())
+    }
+
+    /// Record a page visit, or lengthen it if this visit was reported before.
+    /// A browser reports a long visit several times with a growing duration;
+    /// the visit is identified by its address and start time. Returns the row
+    /// id and whether the row is new.
+    pub fn upsert_page(&self, v: &PageVisit) -> Res<(i64, bool)> {
+        let end = v.at + v.seconds.max(0.0);
+        let detail: Vec<&str> = [v.site, v.author, v.url]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        let detail = detail.join(" · ");
+        let meta = serde_json::json!({
+            "url": v.url, "site": v.site, "author": v.author, "content": v.content,
+        })
+        .to_string();
+        let db = self.db();
+        let existing: Option<i64> = db
+            .query_row(
+                "SELECT id FROM activity WHERE kind = 'page' AND started_at BETWEEN ?1 AND ?2
+                 AND json_extract(meta, '$.url') = ?3 ORDER BY id LIMIT 1",
+                params![v.at - 0.001, v.at + 0.001, v.url],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            db.execute(
+                "UPDATE activity SET ended_at = MAX(COALESCE(ended_at, started_at), ?1),
+                 title = ?2, detail = ?3, meta = ?4 WHERE id = ?5",
+                params![end, v.title, detail, meta, id],
+            )?;
+            return Ok((id, false));
+        }
+        db.execute(
+            "INSERT INTO activity(kind, source, app, title, detail, started_at, ended_at, meta)
+             VALUES ('page', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![v.source, v.host, v.title, detail, v.at, end, meta],
+        )?;
+        Ok((db.last_insert_rowid(), true))
     }
 
     pub fn open_span(
@@ -330,13 +452,30 @@ impl Store {
         Ok(count)
     }
 
-    pub fn purge_older_than(&self, cutoff: f64, cutoff_day: &str) -> Res<usize> {
+    /// Enforce retention. Window focus history older than `history` goes,
+    /// with the day summaries written from it; the library (media, pages,
+    /// files, notes) goes after `library`. `None` keeps that tier forever.
+    pub fn purge(
+        &self,
+        history: Option<f64>,
+        library: Option<f64>,
+        history_day: &str,
+    ) -> Res<usize> {
         let db = self.db();
-        let n = db.execute(
-            "DELETE FROM activity WHERE ended_at IS NOT NULL AND ended_at < ?1",
-            [cutoff],
-        )?;
-        db.execute("DELETE FROM summaries WHERE day < ?1", [cutoff_day])?;
+        let mut n = 0;
+        if let Some(cutoff) = history {
+            n += db.execute(
+                &format!("DELETE FROM activity WHERE kind IN {HISTORY_KINDS} AND ended_at IS NOT NULL AND ended_at < ?1"),
+                [cutoff],
+            )?;
+            db.execute("DELETE FROM summaries WHERE day < ?1", [history_day])?;
+        }
+        if let Some(cutoff) = library {
+            n += db.execute(
+                &format!("DELETE FROM activity WHERE kind NOT IN {HISTORY_KINDS} AND ended_at IS NOT NULL AND ended_at < ?1"),
+                [cutoff],
+            )?;
+        }
         Ok(n)
     }
 
@@ -375,7 +514,8 @@ impl Store {
         rows.collect()
     }
 
-    pub fn timeline(&self, q: &Query) -> Res<Vec<Row>> {
+    /// WHERE clauses for a time window and kinds, over `activity a`.
+    fn filters(&self, q: &Query) -> (Vec<String>, Vec<SqlValue>) {
         let now = self.now();
         let mut clauses = vec!["1=1".to_string()];
         let mut args: Vec<SqlValue> = Vec::new();
@@ -392,6 +532,122 @@ impl Store {
             clauses.push(format!("a.kind IN ({})", vec!["?"; kinds.len()].join(",")));
             args.extend(kinds.into_iter().map(SqlValue::from));
         }
+        (clauses, args)
+    }
+
+    /// The ways to match free text, most exact first: every word as a prefix,
+    /// every word as a substring ("script" finds "JavaScript"), then the rows
+    /// that match the most words.
+    fn matchers(text: &str) -> Vec<(&'static str, String, Vec<SqlValue>)> {
+        let mut out = Vec::new();
+        let all = fts_query(text);
+        if all.is_empty() {
+            return out;
+        }
+        out.push((
+            MATCH_ALL,
+            "a.id IN (SELECT rowid FROM activity_fts WHERE activity_fts MATCH ?)".to_string(),
+            vec![all.clone().into()],
+        ));
+        let patterns = like_patterns(text);
+        if !patterns.is_empty() {
+            let one = "(a.title LIKE ? ESCAPE '\\' OR a.detail LIKE ? ESCAPE '\\' OR a.app LIKE ? ESCAPE '\\')";
+            out.push((
+                MATCH_SUBSTRING,
+                vec![one; patterns.len()].join(" AND "),
+                patterns
+                    .iter()
+                    .flat_map(|p| std::iter::repeat_n(SqlValue::from(p.clone()), 3))
+                    .collect(),
+            ));
+        }
+        if all.contains(' ') {
+            out.push((
+                MATCH_ANY,
+                "a.id IN (SELECT rowid FROM activity_fts WHERE activity_fts MATCH ? ORDER BY rank LIMIT 200)".to_string(),
+                vec![all.replace("* \"", "* OR \"").into()],
+            ));
+        }
+        out
+    }
+
+    pub fn get(&self, id: i64) -> Res<Option<Row>> {
+        let rows = self.rows(
+            &format!("SELECT {COLUMNS} FROM activity a WHERE a.id = ?"),
+            vec![id.into()],
+        )?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Distinct things in a window, each with all its sightings folded
+    /// together, most recently seen first. With `text`, only those that match;
+    /// the second value says how exact the match was ("" without text).
+    pub fn items(&self, text: &str, q: &Query) -> Res<(Vec<Item>, &'static str)> {
+        let now = self.now();
+        let run = |extra: Option<(String, Vec<SqlValue>)>| -> Res<Vec<Item>> {
+            let (mut clauses, mut filter_args) = self.filters(q);
+            let mut args: Vec<SqlValue> = vec![now.into()];
+            if let Some((clause, a)) = extra {
+                clauses.push(clause);
+                filter_args.extend(a);
+            }
+            args.extend(filter_args);
+            args.push((q.limit.max(1) as i64).into());
+            let sql = format!(
+                "SELECT g.kind, g.app, g.title, b.detail, b.meta, g.first, g.last, g.secs, g.n, g.last_id
+                 FROM (SELECT a.kind AS kind, a.app AS app, a.title AS title, MIN(a.started_at) AS first,
+                              MAX(a.started_at) AS last, SUM(COALESCE(a.ended_at, ?) - a.started_at) AS secs,
+                              COUNT(*) AS n, MAX(a.id) AS last_id
+                       FROM activity a WHERE {} GROUP BY a.kind, a.app, a.title) g
+                 JOIN activity b ON b.id = g.last_id
+                 ORDER BY g.last DESC, g.last_id DESC LIMIT ?",
+                clauses.join(" AND ")
+            );
+            let db = self.db();
+            let mut stmt = db.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), |r| {
+                let kind: String = r.get(0)?;
+                let detail: String = r.get(3)?;
+                let meta: String = r.get(4)?;
+                let meta: serde_json::Value = serde_json::from_str(&meta).unwrap_or_default();
+                let text = |key: &str| meta[key].as_str().unwrap_or("").to_string();
+                let (creator, location) = if kind == "page" {
+                    (text("author"), text("url"))
+                } else {
+                    split_detail(&kind, &detail)
+                };
+                Ok(Item {
+                    site: text("site"),
+                    content: text("content"),
+                    creator,
+                    location,
+                    app: r.get(1)?,
+                    title: r.get(2)?,
+                    first_seen: r.get(5)?,
+                    last_seen: r.get(6)?,
+                    seconds: round1(r.get::<_, f64>(7)?.max(0.0)),
+                    times: r.get(8)?,
+                    last_id: r.get(9)?,
+                    kind,
+                })
+            })?;
+            rows.collect()
+        };
+        if text.trim().is_empty() {
+            return Ok((run(None)?, ""));
+        }
+        for (label, clause, args) in Self::matchers(text) {
+            let found = run(Some((clause, args)))?;
+            if !found.is_empty() {
+                return Ok((found, label));
+            }
+        }
+        Ok((Vec::new(), ""))
+    }
+
+    pub fn timeline(&self, q: &Query) -> Res<Vec<Row>> {
+        let now = self.now();
+        let (mut clauses, mut args) = self.filters(q);
         if q.min_seconds > 0.0 {
             clauses.push("(COALESCE(a.ended_at, ?) - a.started_at >= ? OR a.kind IN ('file','note','marker'))".into());
             args.extend([now.into(), q.min_seconds.into()]);
@@ -415,35 +671,29 @@ impl Store {
         Ok(rows.into_iter().next())
     }
 
+    /// Rows matching free text, newest first. Every word must match, as a
+    /// prefix; if nothing does, as a substring anywhere in the row.
     pub fn search(&self, text: &str, q: &Query) -> Res<Vec<Row>> {
-        let m = fts_query(text);
-        if m.is_empty() {
-            return Ok(Vec::new());
+        for (label, clause, match_args) in Self::matchers(text) {
+            if label == MATCH_ANY {
+                break;
+            }
+            let (mut clauses, mut args) = self.filters(q);
+            clauses.push(clause);
+            args.extend(match_args);
+            args.push((q.limit.max(1) as i64).into());
+            let rows = self.rows(
+                &format!(
+                    "SELECT {COLUMNS} FROM activity a WHERE {} ORDER BY a.started_at DESC, a.id DESC LIMIT ?",
+                    clauses.join(" AND ")
+                ),
+                args,
+            )?;
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
         }
-        let now = self.now();
-        let mut clauses = vec!["activity_fts MATCH ?".to_string()];
-        let mut args: Vec<SqlValue> = vec![m.into()];
-        if let Some(s) = q.start {
-            clauses.push("COALESCE(a.ended_at, ?) >= ?".into());
-            args.extend([now.into(), s.into()]);
-        }
-        if let Some(e) = q.end {
-            clauses.push("a.started_at <= ?".into());
-            args.push(e.into());
-        }
-        let kinds = valid_kinds(q.kinds);
-        if !kinds.is_empty() {
-            clauses.push(format!("a.kind IN ({})", vec!["?"; kinds.len()].join(",")));
-            args.extend(kinds.into_iter().map(SqlValue::from));
-        }
-        args.push((q.limit.max(1) as i64).into());
-        self.rows(
-            &format!(
-                "SELECT {COLUMNS} FROM activity_fts JOIN activity a ON a.id = activity_fts.rowid WHERE {} ORDER BY a.started_at DESC LIMIT ?",
-                clauses.join(" AND ")
-            ),
-            args,
-        )
+        Ok(Vec::new())
     }
 
     /// Seconds of focus per app inside [start, end], clipped to the window.
@@ -623,6 +873,97 @@ pub mod tests {
         assert_eq!(fts_query("  "), "");
     }
 
+    fn visit<'a>(title: &'a str, url: &'a str, at: f64, seconds: f64) -> PageVisit<'a> {
+        PageVisit {
+            source: "browser:test",
+            host: "example.com",
+            title,
+            url,
+            site: "Example",
+            author: "Ann Author",
+            content: "article",
+            at,
+            seconds,
+        }
+    }
+
+    #[test]
+    fn items_fold_sightings_and_say_how_they_matched() {
+        let c = TestClock::new();
+        let s = Store::memory(c.clock()).unwrap();
+        let t0 = c.now() - 5000.0;
+        let url = "https://example.com/p/rates";
+        // One visit reported twice, then a second visit the next hour.
+        let first = s
+            .upsert_page(&visit("Interest rates explained", url, t0, 60.0))
+            .unwrap();
+        let again = s
+            .upsert_page(&visit("Interest rates explained", url, t0, 300.0))
+            .unwrap();
+        assert_eq!((first.1, again), (true, (first.0, false)));
+        s.upsert_page(&visit("Interest rates explained", url, t0 + 3600.0, 100.0))
+            .unwrap();
+        s.add_event(
+            "media",
+            "mpris",
+            "spotify",
+            "100% Pure",
+            "Band · https://m.example/t",
+            Some(t0),
+        )
+        .unwrap();
+        s.add_event(
+            "file",
+            "f",
+            "Text Editor",
+            "rates.ods",
+            "/home/u/rates.ods",
+            Some(t0),
+        )
+        .unwrap();
+
+        let (found, how) = s.items("interest rates", &all()).unwrap();
+        assert_eq!(how, MATCH_ALL);
+        assert_eq!(found.len(), 1);
+        let item = &found[0];
+        assert_eq!((item.times, item.seconds), (2, 400.0));
+        assert_eq!((item.first_seen, item.last_seen), (t0, t0 + 3600.0));
+        assert_eq!(
+            (
+                item.site.as_str(),
+                item.creator.as_str(),
+                item.location.as_str(),
+                item.content.as_str()
+            ),
+            ("Example", "Ann Author", url, "article")
+        );
+
+        // Part of a word, which the prefix index cannot find.
+        let (found, how) = s.items("nterest xplain", &all()).unwrap();
+        assert_eq!((found.len(), how), (1, MATCH_SUBSTRING));
+        // No row has both words: the closest ones are offered instead.
+        let (found, how) = s.items("rates spotify", &all()).unwrap();
+        assert_eq!(how, MATCH_ANY);
+        assert_eq!(found.len(), 3);
+        // LIKE wildcards in the question are ordinary characters.
+        assert_eq!(s.items("100% pur", &all()).unwrap().0[0].title, "100% Pure");
+        assert!(s.items("%", &all()).unwrap().0.is_empty());
+        assert!(s.items("zzz", &all()).unwrap().0.is_empty());
+
+        // Media and files keep their creator and location too.
+        let (everything, how) = s.items("", &all()).unwrap();
+        assert_eq!((everything.len(), how), (3, ""));
+        let media = everything.iter().find(|i| i.kind == "media").unwrap();
+        assert_eq!(
+            (media.creator.as_str(), media.location.as_str()),
+            ("Band", "https://m.example/t")
+        );
+        let file = everything.iter().find(|i| i.kind == "file").unwrap();
+        assert_eq!(file.location, "/home/u/rates.ods");
+        // Search (rows, not items) falls back to substrings as well.
+        assert_eq!(s.search("xplain", &all()).unwrap().len(), 2);
+    }
+
     #[test]
     fn usage_clips_spans_to_the_window() {
         let c = TestClock::new();
@@ -660,11 +1001,24 @@ pub mod tests {
             .unwrap();
         s.add_event("note", "cli", "", "secret plan", "", Some(t0 - 5.0))
             .unwrap();
+        // A track from 40 days ago is library, not history: it outlives focus.
+        s.add_event(
+            "media",
+            "mpris",
+            "mpv",
+            "Old film",
+            "",
+            Some(t0 - 40.0 * 86400.0),
+        )
+        .unwrap();
+        let cutoff = t0 - 30.0 * 86400.0;
         assert_eq!(
-            s.purge_older_than(t0 - 30.0 * 86400.0, "2020-01-01")
+            s.purge(Some(cutoff), Some(t0 - 365.0 * 86400.0), "2020-01-01")
                 .unwrap(),
             1
         );
+        assert_eq!(s.search("film", &all()).unwrap().len(), 1);
+        assert_eq!(s.purge(None, Some(cutoff), "").unwrap(), 1);
         assert_eq!(s.forget(Some(t0 - 30.0), None, None, false).unwrap(), 1);
         let titles: Vec<_> = s
             .timeline(&all())

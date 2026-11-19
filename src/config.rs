@@ -28,6 +28,10 @@ pub struct Capture {
     pub idle_seconds: u64,
     pub media_poll_seconds: u64,
     pub files_poll_seconds: u64,
+    /// Pages reported by a browser extension through `omacortex browser install`.
+    pub browser: bool,
+    /// Page visits with less foreground time than this are dropped.
+    pub min_page_seconds: u64,
 }
 
 impl Default for Capture {
@@ -40,6 +44,8 @@ impl Default for Capture {
             idle_seconds: 300,
             media_poll_seconds: 5,
             files_poll_seconds: 60,
+            browser: true,
+            min_page_seconds: 10,
         }
     }
 }
@@ -47,8 +53,11 @@ impl Default for Capture {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Privacy {
-    /// Activity older than this is deleted automatically. 0 keeps everything.
+    /// Window focus history older than this is deleted automatically. 0 keeps everything.
     pub retention_days: u64,
+    /// What you watched, read, opened and noted is kept this long, so you can
+    /// still find a title months later. 0 keeps everything.
+    pub library_days: u64,
     /// Replace e-mail addresses, tokens and URL query strings in titles.
     pub redact: bool,
     /// Window classes never recorded (case-insensitive, exact or glob).
@@ -59,6 +68,11 @@ pub struct Privacy {
     pub exclude_workspaces: Vec<String>,
     /// Files under these directories are never recorded.
     pub exclude_paths: Vec<String>,
+    /// Web hosts never recorded (case-insensitive glob on the host name).
+    pub exclude_hosts: Vec<String>,
+    /// Query parameters kept in page addresses, as "host:param". Every other
+    /// parameter is dropped. Without `v`, a YouTube address names no video.
+    pub keep_url_params: Vec<String>,
 }
 
 fn strings(items: &[&str]) -> Vec<String> {
@@ -69,6 +83,7 @@ impl Default for Privacy {
     fn default() -> Self {
         Self {
             retention_days: 30,
+            library_days: 365,
             redact: true,
             exclude_apps: strings(&[
                 "1password",
@@ -99,6 +114,23 @@ impl Default for Privacy {
                 "~/.local/share/keyrings",
                 "~/.config/omacortex",
             ]),
+            exclude_hosts: strings(&[
+                "accounts.*",
+                "login.*",
+                "signin.*",
+                "auth.*",
+                "sso.*",
+                "id.*",
+                "*.bank",
+                "*bank*",
+                "*paypal*",
+                "*1password*",
+                "*bitwarden*",
+                "*lastpass*",
+                "*okta*",
+                "*auth0*",
+            ]),
+            keep_url_params: strings(&["youtube.com:v", "news.ycombinator.com:id"]),
         }
     }
 }
@@ -264,14 +296,19 @@ min_span_seconds = 2      # drop focus spans shorter than this
 idle_seconds = 300        # away after this long without input
 media_poll_seconds = 5
 files_poll_seconds = 60
+browser = true            # pages from a browser extension (omacortex browser install)
+min_page_seconds = 10     # drop page visits shorter than this
 
 [privacy]
-retention_days = 30       # 0 keeps everything
+retention_days = 30       # window focus history; 0 keeps everything
+library_days = 365        # what you watched, read, opened and noted; 0 keeps everything
 redact = true             # scrub e-mails, tokens and URL queries from titles
 exclude_apps = ["1password", "bitwarden", "org.keepassxc.keepassxc", "keepassxc", "proton-pass", "proton pass", "*pinentry*", "*polkit*", "org.gnome.seahorse.application", "gcr-prompter"]
 exclude_titles = ['(?i)\bincognito\b', '(?i)private browsing', '(?i)\bInPrivate\b', '(?i)\bpassword\b', '(?i)\b(sign|log) ?in\b', '(?i)\bbank(ing)?\b', '(?i)\b2fa\b|two-factor|authenticator']
 exclude_workspaces = []   # e.g. ["special:private"]
 exclude_paths = ["~/.ssh", "~/.gnupg", "~/.password-store", "~/.local/share/keyrings", "~/.config/omacortex"]
+exclude_hosts = ["accounts.*", "login.*", "signin.*", "auth.*", "sso.*", "id.*", "*.bank", "*bank*", "*paypal*", "*1password*", "*bitwarden*", "*lastpass*", "*okta*", "*auth0*"]
+keep_url_params = ["youtube.com:v", "news.ycombinator.com:id"]   # "host:param" kept in page addresses
 
 [model]
 endpoint = "auto"         # "auto", "off", or e.g. "http://127.0.0.1:11434/v1"

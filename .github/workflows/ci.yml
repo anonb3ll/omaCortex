@@ -29,11 +29,14 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --locked
-      - name: Panel model tests
-        run: node --test tests/model.test.js
-      - name: Manifest and i18n are valid JSON
+      - name: Panel model and browser extension tests
+        run: node --test tests/model.test.js tests/extension.test.mjs
+      - name: Manifests and i18n are valid JSON, versions agree
         run: |
-          jq empty manifest.json i18n/en.json
+          jq empty manifest.json i18n/en.json extension/manifest.json
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "$(jq -r .version manifest.json)" = "$version"
+          test "$(jq -r .version extension/manifest.json)" = "$version"
       - name: CLI smoke test through the plugin launcher
         env:
           XDG_DATA_HOME: ${{ runner.temp }}/d
@@ -45,5 +48,9 @@ jobs:
           bin/omacortex status
           bin/omacortex panel-json | jq -e '.status.consent == false'
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-            | bin/omacortex mcp | jq -s -e '.[1].result.tools | length == 8'
+            | bin/omacortex mcp | jq -s -e '.[1].result.tools | length == 11'
+          bin/omacortex browser path | grep -qx "$PWD/extension"
+          # The browser's native-messaging framing: a status request, a 4-byte length each way.
+          printf '\x1e\x00\x00\x00{"v":1,"type":"status"}       ' \
+            | bin/omacortex chrome-extension://kifhcmopbipadknlobfmidehjfgamjdl/ | tail -c +5 | jq -e '.ok and .consent == false'
           ls -l target/release/omacortex
