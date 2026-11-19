@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.anonb3ll.omacortex",
+  "name": "omaCortex",
+  "version": "0.1.0",
+  "author": "anonb3ll",
+  "license": "MIT",
+  "description": "A private, local memory of your day: which windows you worked in, what you watched and listened to, the files you opened. Stays on this machine, summarized by your local model, and available to your agents over MCP.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "omaCortex",
+    "description": "Where was I? Today's sessions, media and files, with pause and forget controls.",
+    "category": "Tools",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSeconds": 60
+    },
+    "schema": [
+      {
+        "key": "refreshSeconds",
+        "type": "integer",
+        "label": "Refresh the bar icon every (seconds)",
+        "description": "How often the bar icon re-reads the recorder's state. The panel refreshes on its own while it is open.",
+        "min": 10,
+        "max": 600,
+        "step": 10,
+        "defaultValue": 60
+      }
+    ]
+  },
+  "homepage": "https://github.com/anonb3ll/omaCortex",
+  "repository": "https://github.com/anonb3ll/omaCortex"
+}
