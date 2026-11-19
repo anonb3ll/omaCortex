@@ -1,14 +1,22 @@
 #!/bin/sh
-# omacortex launcher: runs the bundled Python package with the system Python
-# (Omarchy ships it). Works from the plugin folder or through a symlink.
+# omacortex launcher used by the shell plugin. Runs the recorder binary that
+# install.sh built (target/release) or downloaded (libexec/), else one on PATH.
 set -eu
 self=$(readlink -f "$0")
 root=$(dirname "$(dirname "$self")")
-PYTHON=${OMACORTEX_PYTHON:-/usr/bin/python3}
-[ -x "$PYTHON" ] || PYTHON=python3
-exec "$PYTHON" -I -c '
-import sys
-sys.path.insert(0, sys.argv.pop(1))
-from omacortex.cli import main
-sys.exit(main(sys.argv[1:]))
-' "$root/src" "$@"
+for candidate in "${OMACORTEX_BIN:-}" "$root/target/release/omacortex" "$root/libexec/omacortex"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+old_ifs=$IFS
+IFS=:
+for dir in $PATH; do
+  candidate="$dir/omacortex"
+  if [ -x "$candidate" ] && [ "$(readlink -f "$candidate")" != "$self" ]; then
+    IFS=$old_ifs
+    exec "$candidate" "$@"
+  fi
+done
+echo "omacortex: the recorder is not installed yet; run $root/install.sh" >&2
+exit 127

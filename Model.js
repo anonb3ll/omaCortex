@@ -49,7 +49,8 @@ function shortTitle(title, app, limit) {
 }
 
 // One headline for the panel and the bar tooltip.
-function headline(data, now) {
+function headline(data, now, missing) {
+  if (missing) return { key: "missing", text: "Recorder not installed", urgent: true }
   if (!data) return { key: "loading", text: "Loading…", urgent: false }
   var s = data.status || {}
   if (!s.consent) return { key: "off", text: "Not recording", urgent: false }

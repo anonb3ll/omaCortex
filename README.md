@@ -51,11 +51,21 @@ See [PRIVACY.md](PRIVACY.md) for the full list.
 omarchy plugin add https://github.com/anonb3ll/omaCortex --enable
 ```
 
-This adds the bar icon and starts the recorder with the shell. Open the
-panel, read what it records, and press **Start recording**.
+This adds the bar icon. The recorder itself is a small Rust binary, so the
+first time you open the panel it offers **Install recorder**, which runs
+`install.sh` in a terminal: it builds with `cargo` if you have Rust
+(`sudo pacman -S rust`), otherwise it downloads the release binary for your
+architecture and checks its sha256. Then press **Start recording**.
 
-The plugin needs nothing beyond what Omarchy ships: Python 3.11+ and
-`busctl` (systemd). Optional keybindings for `~/.config/hypr/bindings.lua`:
+Or do both steps from a terminal:
+
+```bash
+omarchy plugin add https://github.com/anonb3ll/omaCortex --enable
+~/.config/omarchy/plugins/io.github.anonb3ll.omacortex/install.sh
+```
+
+At run time it needs only what Omarchy ships (`busctl` from systemd).
+Optional keybindings for `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER + ALT + O", "omaCortex", { ipc = "io.github.anonb3ll.omacortex.toggle" })
@@ -67,11 +77,7 @@ IPC methods on `omacortex`: `toggle`, `pause`, `pauseHour`, `resume`,
 
 ### The command, and agents
 
-```bash
-~/.config/omarchy/plugins/io.github.anonb3ll.omacortex/install.sh
-```
-
-links `omacortex` into `~/.local/bin`. Use `install.sh --systemd` instead if
+`install.sh` also links `omacortex` into `~/.local/bin`. Use `install.sh --systemd` if
 you want the recorder as a systemd user service without the shell plugin
 (the two never run twice: a lock file keeps one recorder per user).
 
@@ -165,17 +171,26 @@ recently-used.xbel ─────┘                    ▲                    
   focus stops counting; media keeps counting, because you may be watching.
 - **Crash safety**: a heartbeat every 30 s closes any span a crash left open.
 
-Stdlib-only Python (no pip installs), QML for the panel.
+One Rust binary (about 2.6 MB, linked only against libc) for the recorder,
+CLI and MCP server, and QML for the panel. The daemon idles at about 5 MB of
+memory and no measurable CPU; it uses plain threads, no async runtime, no TLS
+stack and no D-Bus library. The database schema is the same one 0.1 wrote.
 
 ## Develop
 
 ```bash
-uvx ruff check . && uvx ruff format --check .
-uvx pytest
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
+cargo test
 node --test tests/model.test.js
 omarchy plugin validate .
 omarchy agent look plugin .
 ```
+
+## Releases
+
+Tag `vX.Y.Z` (matching `version` in `Cargo.toml`) to build x86_64 and aarch64
+binaries with build-provenance attestations; `install.sh` downloads from the
+release whose version matches the checkout.
 
 ## License
 

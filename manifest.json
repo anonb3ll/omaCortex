@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.anonb3ll.omacortex",
   "name": "omaCortex",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "anonb3ll",
   "license": "MIT",
   "description": "A private, local memory of your day: which windows you worked in, what you watched and listened to, the files you opened. Stays on this machine, summarized by your local model, and available to your agents over MCP.",
