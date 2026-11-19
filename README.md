@@ -172,7 +172,7 @@ Stdlib-only Python (no pip installs), QML for the panel.
 ```bash
 uvx ruff check . && uvx ruff format --check .
 uvx pytest
-node --test tests/
+node --test tests/model.test.js
 omarchy plugin validate .
 omarchy agent look plugin .
 ```

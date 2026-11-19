@@ -12,6 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.11", "3.13"]
     steps:
@@ -30,7 +31,7 @@ jobs:
       - name: Python tests
         run: pytest
       - name: Panel model tests
-        run: node --test tests/
+        run: node --test tests/model.test.js
       - name: Manifest and i18n are valid JSON
         run: |
           python -c "import json; json.load(open('manifest.json')); json.load(open('i18n/en.json'))"
