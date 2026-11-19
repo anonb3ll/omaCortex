@@ -34,6 +34,7 @@ test("titles lose the trailing app name and stay short", () => {
 
 test("headline covers every state", () => {
   assert.equal(Model.headline(null, NOW).key, "loading")
+  assert.equal(Model.headline(base({}), NOW, true).key, "missing")
   assert.equal(Model.headline(base({ consent: false }), NOW).key, "off")
   assert.equal(Model.headline(base({ paused: true }), NOW).key, "paused")
   assert.equal(Model.headline(base({ paused: true, paused_until: NOW + 600 }), NOW).key, "paused-until")

@@ -30,9 +30,10 @@ Item {
     command: [root.cli, "daemon", "--if-not-running"]
     running: true
     onExited: function(exitCode) {
-      // 0: stopped cleanly or another recorder holds the lock. Anything else is
+      // 0: stopped cleanly or another recorder holds the lock. 127: the binary
+      // is not installed yet (the panel offers to install it). Anything else is
       // a crash: retry with backoff, then give up until the shell reloads.
-      if (exitCode !== 0 && root.restarts < 5) restartTimer.start()
+      if (exitCode !== 0 && exitCode !== 127 && root.restarts < 5) restartTimer.start()
     }
   }
 
