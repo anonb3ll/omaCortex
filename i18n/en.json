@@ -28,5 +28,8 @@
   "action.summarize": "Summarize today",
   "action.refresh": "Refresh",
   "playing": "playing",
-  "section.notes": "NOTES"
+  "section.notes": "NOTES",
+  "status.missing": "Recorder not installed",
+  "missing.body": "The omaCortex recorder is a small Rust program that is not installed yet. Install builds it with cargo if you have Rust, or downloads the checksum-verified release binary.",
+  "missing.install": "Install recorder"
 }

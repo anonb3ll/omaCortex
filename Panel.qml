@@ -24,7 +24,10 @@ Panel {
   property string flash: ""
   property real now: Date.now() / 1000
 
-  readonly property var head: Model.headline(root.info, root.now)
+  // bin/omacortex exits 127 until install.sh has built or downloaded the recorder.
+  property bool missing: false
+  readonly property string installer: decodeURIComponent(String(Qt.resolvedUrl("install.sh")).replace(/^file:\/\//, ""))
+  readonly property var head: Model.headline(root.info, root.now, root.missing)
   readonly property bool hasConsent: !!(root.info && root.info.status.consent)
   readonly property bool isPaused: !!(root.info && root.info.status.paused)
   readonly property var sessions: Model.sessionRows(root.info)
@@ -81,6 +84,7 @@ Panel {
         root.now = Date.now() / 1000
       }
     }
+    onExited: function(exitCode) { root.missing = exitCode === 127 }
   }
 
   Process {
@@ -270,11 +274,39 @@ Panel {
           }
         }
 
+        // ---------- Recorder binary not installed yet ----------
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+          visible: root.missing
+
+          Text {
+            textFormat: Text.PlainText
+            text: strings.t("missing.body")
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            width: parent.width
+            wrapMode: Text.Wrap
+          }
+          Button {
+            text: strings.t("missing.install")
+            iconText: "󰏔"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: {
+              Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", root.installer])
+              root.close()
+            }
+          }
+        }
+
         // ---------- First run: consent ----------
         Column {
           width: parent.width
           spacing: Style.space(10)
-          visible: root.info !== null && !root.hasConsent
+          visible: root.info !== null && !root.hasConsent && !root.missing
 
           Text {
             textFormat: Text.PlainText
