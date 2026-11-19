@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>omaCortex</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 13px/1.45 system-ui, sans-serif; margin: 0; padding: 14px 16px; width: 280px; }
+  h1 { font-size: 14px; margin: 0 0 6px; }
+  p { margin: 0 0 10px; }
+  .muted { opacity: 0.7; }
+  label { display: flex; gap: 8px; align-items: center; margin: 0 0 10px; }
+  code { font-size: 12px; }
+  #state { font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>omaCortex</h1>
+  <p id="state">Checking…</p>
+  <p id="detail" class="muted"></p>
+  <label><input type="checkbox" id="enabled"> Remember pages from this browser</label>
+  <p class="muted">Sends the address without its query, the title, site, author and time in the foreground to omaCortex on this computer. Never page text, and never from private windows.</p>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

@@ -105,6 +105,7 @@ cat <<EOF
 
 Next:
   omacortex enable          start recording (nothing is recorded until you do)
+  omacortex browser install remember the pages you read and watch (optional)
   omacortex doctor          check sensors and your local model
   omacortex now             what you are doing right now
 

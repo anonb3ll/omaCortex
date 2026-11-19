@@ -9,7 +9,7 @@
   "status.recording": "Recording",
   "status.focus-today": "%1 focused today",
   "consent.heading": "A private memory of your day",
-  "consent.body": "omaCortex records which window has focus (app and title), what is playing, and which files you open, so you and your agents can answer \"where was I?\". It never takes screenshots, reads window contents, or logs keystrokes. Everything stays in a local database that only you can read. Password managers, private browser windows and sign-in pages are never recorded.",
+  "consent.body": "omaCortex records which window has focus (app and title), what is playing, which files you open and, if you connect a browser, the pages you read by title and address, so you and your agents can answer \"where was I?\". It never takes screenshots, reads window or page contents, or logs keystrokes. Everything stays in a local database that only you can read. Password managers, private browser windows and sign-in pages are never recorded.",
   "consent.start": "Start recording",
   "section.now": "NOW",
   "section.today": "TODAY",
@@ -31,5 +31,9 @@
   "section.notes": "NOTES",
   "status.missing": "Recorder not installed",
   "missing.body": "The omaCortex recorder is a small Rust program that is not installed yet. Install builds it with cargo if you have Rust, or downloads the checksum-verified release binary.",
-  "missing.install": "Install recorder"
+  "missing.install": "Install recorder",
+  "section.pages": "READ IN THE BROWSER",
+  "section.resume": "BEFORE YOUR BREAK",
+  "resume.away-since": "You stepped away at %1.",
+  "resume.away-for": "You stepped away at %1 for %2."
 }

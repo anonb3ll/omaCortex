@@ -4,6 +4,8 @@
 set -eu
 self=$(readlink -f "$0")
 root=$(dirname "$(dirname "$self")")
+# Lets `omacortex browser path` find the extension folder next to this launcher.
+export OMACORTEX_ROOT="$root"
 for candidate in "${OMACORTEX_BIN:-}" "$root/target/release/omacortex" "$root/libexec/omacortex"; do
   if [ -n "$candidate" ] && [ -x "$candidate" ]; then
     exec "$candidate" "$@"

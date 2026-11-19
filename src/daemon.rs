@@ -214,18 +214,17 @@ impl Daemon {
     }
 
     fn purge(&self, now: f64) {
-        let days = self.cfg.settings.privacy.retention_days;
-        if days == 0 {
-            return;
-        }
-        let cutoff = now - days as f64 * 86400.0;
-        let day = timeutil::day_bounds("today", cutoff)
+        let p = &self.cfg.settings.privacy;
+        let cutoff = |days: u64| (days > 0).then_some(now - days as f64 * 86400.0);
+        let history = cutoff(p.retention_days);
+        let day = history
+            .and_then(|c| timeutil::day_bounds("today", c).ok())
             .map(|d| d.0)
             .unwrap_or_default();
-        if let Ok(n) = self.store.purge_older_than(cutoff, &day)
+        if let Ok(n) = self.store.purge(history, cutoff(p.library_days), &day)
             && n > 0
         {
-            eprintln!("omacortex: retention: removed {n} row(s) older than {days} days");
+            eprintln!("omacortex: retention: removed {n} expired row(s)");
         }
     }
 

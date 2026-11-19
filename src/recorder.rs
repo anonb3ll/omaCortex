@@ -37,6 +37,29 @@ pub struct Track {
     pub url: String,
 }
 
+/// One visit to a web page, as a browser extension reports it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Page {
+    pub url: String,
+    pub title: String,
+    pub site: String,
+    pub author: String,
+    /// "video", "article" or "page".
+    pub content: String,
+    /// Foreground seconds so far.
+    pub seconds: f64,
+    /// When the visit started (epoch seconds). The same visit keeps the same start.
+    pub at: Option<f64>,
+    /// Which extension reported it.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PageOutcome {
+    Stored(i64),
+    Skipped(&'static str),
+}
+
 type TrackKey = (String, String, String);
 
 impl Track {
@@ -231,6 +254,67 @@ impl Recorder {
                 Some(at),
             )
             .is_ok()
+    }
+
+    /// A page visit reported by a browser extension. Unlike the sensors, the
+    /// reporter is another program, so nothing it sends is trusted: the
+    /// address must be a web page on a host that is not excluded, the title
+    /// must pass the same rules as a window title, and every field is cleaned.
+    pub fn page(&self, page: &Page, min_seconds: f64) -> PageOutcome {
+        if !self.state.read().recording() {
+            return PageOutcome::Skipped("paused");
+        }
+        let Some(host) = crate::privacy::host_of(&page.url) else {
+            return PageOutcome::Skipped("not a web page");
+        };
+        if self.privacy.host_excluded(&host) || self.privacy.title_excluded(&page.title) {
+            return PageOutcome::Skipped("excluded");
+        }
+        if !page.seconds.is_finite() || page.seconds < min_seconds {
+            return PageOutcome::Skipped("too short");
+        }
+        let now = (self.clock)();
+        // A visit cannot start in the future or last longer than a day.
+        let seconds = page.seconds.min(86400.0);
+        let at = match page.at {
+            Some(at) if at.is_finite() && at > 0.0 && at <= now + 60.0 => at.min(now),
+            _ => now - seconds,
+        };
+        let title = self.privacy.clean(&page.title);
+        let Some(url) = self.privacy.clean_url(&page.url) else {
+            return PageOutcome::Skipped("not a web page");
+        };
+        if title.is_empty() {
+            return PageOutcome::Skipped("no title");
+        }
+        let content = match page.content.as_str() {
+            "video" | "article" => page.content.as_str(),
+            _ => "page",
+        };
+        let source = format!(
+            "browser:{}",
+            crate::privacy::bounded(&page.source, 24)
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect::<String>()
+        );
+        let visit = crate::store::PageVisit {
+            source: source.trim_end_matches(':'),
+            host: host.strip_prefix("www.").unwrap_or(&host),
+            title: &title,
+            url: &url,
+            site: &self.privacy.clean(&crate::privacy::bounded(&page.site, 80)),
+            author: &self
+                .privacy
+                .clean(&crate::privacy::bounded(&page.author, 120)),
+            content,
+            at,
+            seconds,
+        };
+        match self.store.upsert_page(&visit) {
+            Ok((id, _)) => PageOutcome::Stored(id),
+            Err(_) => PageOutcome::Skipped("store error"),
+        }
     }
 
     /// A note is something you chose to record, so it is kept even while paused.
@@ -528,6 +612,90 @@ pub mod tests {
         assert!(!rec.file_opened("/tmp/oc-docs/id_rsa", "", None));
         let titles: Vec<_> = rows(&store, "file").into_iter().map(|r| r.title).collect();
         assert_eq!(titles, vec!["plan.md"]);
+    }
+
+    fn page(url: &str, title: &str, seconds: f64, at: Option<f64>) -> Page {
+        Page {
+            url: url.into(),
+            title: title.into(),
+            site: "YouTube".into(),
+            author: "A Channel".into(),
+            content: "video".into(),
+            seconds,
+            at,
+            source: "companion".into(),
+        }
+    }
+
+    #[test]
+    fn pages_are_guarded_cleaned_and_lengthened() {
+        let (mut rec, store, state, c) = make(true);
+        rec.privacy = Privacy::from_settings(&crate::config::Privacy::default());
+        let t0 = c.now();
+        c.tick(600.0);
+        let watch = "https://www.youtube.com/watch?v=abc123XYZ_-&t=10s";
+        let PageOutcome::Stored(id) =
+            rec.page(&page(watch, "Async Rust in practice", 60.0, Some(t0)), 10.0)
+        else {
+            panic!("not stored")
+        };
+        // The same visit reported again with more time lengthens the row.
+        assert_eq!(
+            rec.page(
+                &page(watch, "Async Rust in practice", 540.0, Some(t0)),
+                10.0
+            ),
+            PageOutcome::Stored(id)
+        );
+        let rows = rows(&store, "page");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].app.as_str(), rows[0].seconds),
+            ("youtube.com", 540.0)
+        );
+        assert_eq!(rows[0].source, "browser:companion");
+        assert_eq!(
+            rows[0].detail,
+            "YouTube · A Channel · https://www.youtube.com/watch?v=abc123XYZ_-"
+        );
+
+        for (url, title, secs, why) in [
+            ("https://accounts.google.com/x", "Account", 60.0, "excluded"),
+            (
+                "https://example.com/",
+                "Sign in to Example",
+                60.0,
+                "excluded",
+            ),
+            ("https://example.com/", "Fine", 3.0, "too short"),
+            ("chrome://settings", "Settings", 60.0, "not a web page"),
+            ("https://example.com/", "  ", 60.0, "no title"),
+            ("https://example.com/", "Fine", f64::NAN, "too short"),
+        ] {
+            assert_eq!(
+                rec.page(&page(url, title, secs, None), 10.0),
+                PageOutcome::Skipped(why),
+                "{url} {title}"
+            );
+        }
+        // A start time in the future is not believed.
+        let PageOutcome::Stored(late) = rec.page(
+            &page("https://example.com/a", "Later", 30.0, Some(c.now() + 9e6)),
+            10.0,
+        ) else {
+            panic!("not stored")
+        };
+        assert!(store.get(late).unwrap().unwrap().started_at <= c.now());
+
+        state.pause(None).unwrap();
+        assert_eq!(
+            rec.page(
+                &page("https://example.com/b", "While paused", 60.0, None),
+                10.0
+            ),
+            PageOutcome::Skipped("paused")
+        );
+        assert_eq!(super::tests::rows(&store, "page").len(), 2);
     }
 
     #[test]

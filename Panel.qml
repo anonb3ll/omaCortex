@@ -32,6 +32,8 @@ Panel {
   readonly property bool isPaused: !!(root.info && root.info.status.paused)
   readonly property var sessions: Model.sessionRows(root.info)
   readonly property var media: Model.mediaRows(root.info)
+  readonly property var pages: Model.pageRows(root.info)
+  readonly property var resume: Model.resume(root.info, root.now)
   readonly property var files: Model.fileRows(root.info)
   readonly property var notes: Model.noteRows(root.info)
 
@@ -354,6 +356,29 @@ Panel {
           }
         }
 
+        // ---------- Before your break ----------
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+          visible: root.hasConsent && !!root.resume
+
+          PanelSectionHeader { text: strings.t("section.resume"); foreground: root.foreground; fontFamily: root.fontFamily }
+          Caption {
+            width: parent.width
+            text: !root.resume ? "" : (root.resume.away ? strings.t("resume.away-for").arg(root.resume.since).arg(root.resume.away) : strings.t("resume.away-since").arg(root.resume.since))
+          }
+          Repeater {
+            model: root.resume ? root.resume.rows : []
+            ActivityRow {
+              required property var modelData
+              time: modelData.time
+              label: modelData.app
+              detail: modelData.title
+              length: modelData.length
+            }
+          }
+        }
+
         PanelSeparator { foreground: root.foreground; visible: root.hasConsent }
 
         // ---------- Today ----------
@@ -393,6 +418,25 @@ Panel {
               detail: modelData.source
               length: modelData.ongoing ? strings.t("playing") : modelData.length
               live: modelData.ongoing
+            }
+          }
+        }
+
+        // ---------- Pages (from the browser extension) ----------
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+          visible: root.hasConsent && root.pages.length > 0
+
+          PanelSectionHeader { text: strings.t("section.pages"); foreground: root.foreground; fontFamily: root.fontFamily }
+          Repeater {
+            model: root.pages
+            ActivityRow {
+              required property var modelData
+              time: modelData.time
+              label: modelData.title
+              detail: modelData.source
+              length: modelData.length
             }
           }
         }

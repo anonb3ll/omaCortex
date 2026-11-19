@@ -5,7 +5,7 @@ use crate::llm;
 use crate::privacy::Privacy;
 use crate::sessions::{self, Session};
 use crate::state::State;
-use crate::store::{Query, Row, Store, Usage};
+use crate::store::{Item, Query, Row, Store, Usage};
 use crate::timeutil::{self, Clock, clock, day_bounds, human_duration, iso_opt};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -27,8 +27,140 @@ pub struct Digest {
     pub usage: Vec<Usage>,
     pub sessions: Vec<Session>,
     pub media: Vec<Row>,
+    pub pages: Vec<Row>,
     pub files: Vec<Row>,
     pub notes: Vec<Row>,
+}
+
+/// A recall question taken apart: the words to search for, the kinds its
+/// wording points at, and the time it names.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RecallQuery {
+    pub terms: String,
+    pub kinds: Vec<String>,
+    pub range: Option<(f64, f64)>,
+}
+
+/// Words that say what kind of thing is wanted rather than what it was about.
+fn kind_hint(word: &str) -> Option<&'static [&'static str]> {
+    Some(match word {
+        "video" | "videos" | "watched" | "watch" | "watching" | "film" | "movie" | "clip" => {
+            &["media", "page"]
+        }
+        "article" | "articles" | "post" | "posts" | "blog" | "essay" | "newsletter" | "read"
+        | "reading" | "page" | "pages" | "website" | "site" | "tab" => &["page"],
+        "song" | "songs" | "music" | "track" | "album" | "listened" | "listening" | "podcast"
+        | "episode" | "heard" => &["media"],
+        "file" | "files" | "document" | "documents" | "doc" | "pdf" | "opened" => &["file"],
+        "note" | "notes" | "noted" => &["note"],
+        "window" | "app" => &["focus"],
+        _ => return None,
+    })
+}
+
+const FILLER: [&str; 52] = [
+    "a",
+    "an",
+    "the",
+    "i",
+    "id",
+    "i'd",
+    "my",
+    "me",
+    "that",
+    "this",
+    "those",
+    "these",
+    "was",
+    "were",
+    "is",
+    "are",
+    "did",
+    "do",
+    "does",
+    "what",
+    "which",
+    "who",
+    "when",
+    "where",
+    "about",
+    "on",
+    "in",
+    "of",
+    "to",
+    "for",
+    "from",
+    "with",
+    "and",
+    "or",
+    "it",
+    "its",
+    "title",
+    "titled",
+    "name",
+    "named",
+    "called",
+    "something",
+    "some",
+    "thing",
+    "one",
+    "saw",
+    "seen",
+    "looked",
+    "looking",
+    "find",
+    "remember",
+    "had",
+];
+
+/// "the rust talk I watched last tuesday" becomes: search "rust talk", in
+/// media and pages, on that day.
+pub fn parse_recall(text: &str, now: f64) -> RecallQuery {
+    let (range, words) = timeutil::extract_range(text, now);
+    let mut kinds: Vec<String> = Vec::new();
+    let mut terms: Vec<String> = Vec::new();
+    for word in words {
+        if let Some(hint) = kind_hint(&word) {
+            for k in hint {
+                if !kinds.iter().any(|have| have == k) {
+                    kinds.push((*k).to_string());
+                }
+            }
+        } else if !FILLER.contains(&word.as_str()) {
+            terms.push(word);
+        }
+    }
+    RecallQuery {
+        terms: terms.join(" "),
+        kinds,
+        range,
+    }
+}
+
+/// What a recall question found, and how it was read.
+pub struct Recalled {
+    pub terms: String,
+    pub kinds: Vec<String>,
+    pub range: Option<(f64, f64)>,
+    /// How exact the text match was; see `store::MATCH_ALL` and friends.
+    pub matched: &'static str,
+    /// Nothing of the asked kind matched, so every kind was searched.
+    pub widened: bool,
+    pub items: Vec<Item>,
+}
+
+pub fn iso_items(items: &[Item]) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|i| {
+                let mut v = serde_json::to_value(i).unwrap_or(Value::Null);
+                v["first_seen"] = json!(timeutil::iso(i.first_seen));
+                v["last_seen"] = json!(timeutil::iso(i.last_seen));
+                v
+            })
+            .collect(),
+    )
 }
 
 pub struct Cortex {
@@ -92,8 +224,9 @@ impl Cortex {
             "recording": rec.recording(),
             "daemon": self.daemon_running(),
             "away": self.store.get_meta("away").as_deref() == Some("1"),
-            "sources": {"windows": s.capture.windows, "media": s.capture.media, "files": s.capture.files},
+            "sources": {"windows": s.capture.windows, "media": s.capture.media, "files": s.capture.files, "browser": s.capture.browser},
             "retention_days": s.privacy.retention_days,
+            "library_days": s.privacy.library_days,
             "rows": stats.rows,
             "oldest": iso_opt(stats.oldest),
             "db_bytes": stats.bytes,
@@ -161,7 +294,135 @@ impl Cortex {
             "recent_sessions": sessions.into_iter().skip(skip).collect::<Vec<_>>(),
             "playing": playing,
             "recent_notes": notes,
+            "before_break": self.before_break()?,
             "recording": self.state.read().recording(),
+        }))
+    }
+
+    /// Distinct things seen in a window, each with its sightings folded
+    /// together: by default what was watched, listened to and read.
+    pub fn library(
+        &self,
+        text: &str,
+        only: &[String],
+        start: Option<f64>,
+        end: Option<f64>,
+        limit: usize,
+    ) -> Res<(Vec<Item>, &'static str)> {
+        let default = kinds(&["media", "page"]);
+        Ok(self.store.items(
+            text,
+            &Query {
+                start,
+                end,
+                kinds: if only.is_empty() { &default } else { only },
+                limit,
+                ..Default::default()
+            },
+        )?)
+    }
+
+    /// Answer a recall question in plain words: "that substack article about
+    /// interest rates last week". The wording picks the kinds and the time;
+    /// if nothing of those kinds matches, every kind is tried.
+    pub fn recall_items(&self, text: &str, limit: usize) -> Res<Recalled> {
+        let q = parse_recall(text, self.now_ts());
+        let all = kinds(&["page", "media", "file", "note", "focus"]);
+        let find = |k: &[String]| {
+            self.store.items(
+                &q.terms,
+                &Query {
+                    start: q.range.map(|r| r.0),
+                    end: q.range.map(|r| r.1),
+                    kinds: k,
+                    limit,
+                    ..Default::default()
+                },
+            )
+        };
+        let (mut items, mut matched) = find(if q.kinds.is_empty() { &all } else { &q.kinds })?;
+        let mut widened = false;
+        if items.is_empty() && !q.kinds.is_empty() {
+            (items, matched) = find(&all)?;
+            widened = !items.is_empty();
+        }
+        Ok(Recalled {
+            kinds: if widened || q.kinds.is_empty() {
+                all
+            } else {
+                q.kinds
+            },
+            terms: q.terms,
+            range: q.range,
+            matched,
+            widened,
+            items,
+        })
+    }
+
+    pub fn recall(&self, text: &str, limit: usize) -> Res<Value> {
+        let r = self.recall_items(text, limit)?;
+        Ok(json!({
+            "terms": r.terms,
+            "kinds": r.kinds,
+            "since": r.range.map(|r| timeutil::iso(r.0)),
+            "until": r.range.map(|r| timeutil::iso(r.1)),
+            "match": r.matched,
+            "widened": r.widened,
+            "items": iso_items(&r.items),
+        }))
+    }
+
+    /// Everything going on around a moment: what was focused, playing, open
+    /// and noted within `minutes` either side of it, oldest first.
+    pub fn around(&self, at: f64, minutes: f64, limit: usize) -> Res<Vec<Row>> {
+        let all = kinds(&["focus", "media", "page", "file", "note"]);
+        Ok(self.store.timeline(&Query {
+            start: Some(at - minutes * 60.0),
+            end: Some(at + minutes * 60.0),
+            kinds: &all,
+            limit,
+            ..Default::default()
+        })?)
+    }
+
+    /// What you were doing just before you last stepped away, so the thread
+    /// can be picked up again: the last few sessions before the break.
+    pub fn before_break(&self) -> Res<Value> {
+        let now = self.now_ts();
+        let marker = kinds(&["marker"]);
+        let markers = self.store.timeline(&Query {
+            start: Some(now - 12.0 * 3600.0),
+            kinds: &marker,
+            limit: 100,
+            newest_first: true,
+            ..Default::default()
+        })?;
+        let Some(away) = markers.iter().find(|m| m.title == "away") else {
+            return Ok(Value::Null);
+        };
+        let back = markers
+            .iter()
+            .find(|m| m.title == "back" && m.started_at >= away.started_at);
+        let mut sessions: Vec<Session> = self
+            .sessions(
+                Some(away.started_at - 45.0 * 60.0),
+                Some(away.started_at),
+                200,
+            )?
+            .into_iter()
+            .filter(|s| s.active_seconds >= 20.0)
+            .collect();
+        sessions.reverse();
+        sessions.truncate(3);
+        if sessions.is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(json!({
+            "away_at": away.started_at,
+            "back_at": back.map(|b| b.started_at),
+            "away_seconds": back.map(|b| (b.started_at - away.started_at).round()),
+            "sessions": sessions,
         }))
     }
 
@@ -179,6 +440,7 @@ impl Cortex {
             })?)
         };
         let (media, file, note) = (kinds(&["media"]), kinds(&["file"]), kinds(&["note"]));
+        let page = kinds(&["page"]);
         Ok(Digest {
             day: label,
             usage: self.store.usage(start, Some(end), 12)?,
@@ -188,6 +450,7 @@ impl Cortex {
                 .filter(|s| s.active_seconds >= 60.0)
                 .collect(),
             media: q(&media, 30.0, 50)?,
+            pages: q(&page, 30.0, 50)?,
             files: q(&file, 0.0, 50)?,
             notes: q(&note, 0.0, 50)?,
         })
@@ -235,6 +498,18 @@ impl Cortex {
                 ));
             }
         }
+        if !d.pages.is_empty() {
+            lines.push("Read or watched in the browser:".into());
+            for p in &d.pages {
+                lines.push(format!(
+                    "- {} {} [{}] {}",
+                    clock(p.started_at),
+                    p.title,
+                    p.app,
+                    human_duration(p.seconds)
+                ));
+            }
+        }
         if !d.files.is_empty() {
             let names: Vec<&str> = d.files.iter().take(25).map(|f| f.title.as_str()).collect();
             lines.push(format!("Files opened: {}", names.join(", ")));
@@ -265,6 +540,7 @@ impl Cortex {
         }
         if digest.sessions.is_empty()
             && digest.media.is_empty()
+            && digest.pages.is_empty()
             && digest.files.is_empty()
             && digest.notes.is_empty()
         {
@@ -295,31 +571,25 @@ impl Cortex {
     }
 
     pub fn ask(&self, question: &str) -> Res<Value> {
-        let now = self.now_ts();
-        let hits = self.store.search(
-            question,
-            &Query {
-                start: Some(now - 30.0 * 86400.0),
-                limit: 40,
-                ..Default::default()
-            },
-        )?;
+        let found = self.recall(question, 40)?;
+        let items = found["items"].as_array().cloned().unwrap_or_default();
         let mut context = vec![Self::digest_text(&self.digest("today")?, 5000)];
-        if !hits.is_empty() {
-            context.push("Matching activity (newest first):".into());
-            for h in &hits {
-                context.push(
-                    format!(
-                        "- {} [{}] {}: {} {}",
-                        timeutil::stamp(h.started_at),
-                        h.kind,
-                        h.app,
-                        h.title,
-                        h.detail
-                    )
-                    .trim_end()
-                    .to_string(),
-                );
+        if !items.is_empty() {
+            context.push("Matching activity (most recent first):".into());
+            for i in &items {
+                let text = |key: &str| i[key].as_str().unwrap_or("");
+                let by = [text("creator"), text("site"), text("app")]
+                    .into_iter()
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("");
+                context.push(format!(
+                    "- last seen {} [{}] {} ({by}), {} time(s), {}",
+                    text("last_seen"),
+                    text("kind"),
+                    text("title"),
+                    i["times"].as_i64().unwrap_or(1),
+                    human_duration(i["seconds"].as_f64().unwrap_or(0.0)),
+                ));
             }
         }
         let model = llm::resolve(&self.cfg.settings.model)?;
@@ -328,7 +598,7 @@ impl Cortex {
             &format!("{}\n\nQuestion: {question}", context.join("\n")),
         )?;
         Ok(
-            json!({"answer": answer, "model": model.model, "evidence": hits.into_iter().take(10).collect::<Vec<_>>()}),
+            json!({"answer": answer, "model": model.model, "evidence": items.into_iter().take(10).collect::<Vec<_>>()}),
         )
     }
 
@@ -355,6 +625,7 @@ impl Cortex {
             })?)
         };
         let (media, file, note) = (kinds(&["media"]), kinds(&["file"]), kinds(&["note"]));
+        let page = kinds(&["page"]);
         let label = day_bounds("today", now)?.0;
         Ok(json!({
             "status": {
@@ -366,6 +637,8 @@ impl Cortex {
             "sessions": sessions,
             "usage": self.store.usage(start, None, 5)?,
             "media": recent(&media, 10.0, 5)?,
+            "pages": recent(&page, 10.0, 5)?,
+            "before_break": self.before_break()?,
             "files": recent(&file, 0.0, 5)?,
             "notes": recent(&note, 0.0, 3)?,
             "summary": self.store.get_summary(&label).map(|s| s.text).unwrap_or_default(),

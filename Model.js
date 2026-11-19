@@ -104,6 +104,45 @@ function mediaRows(data) {
   return out
 }
 
+// Pages reported by the browser extension: title, then the site it was on.
+function pageRows(data) {
+  var rows = (data && data.pages) || []
+  var out = []
+  for (var i = 0; i < rows.length && out.length < 4; i++) {
+    var p = rows[i]
+    out.push({
+      time: clock(p.started_at),
+      length: duration(p.seconds),
+      title: shortTitle(p.title, "", 56),
+      source: String(p.app || "")
+    })
+  }
+  return out
+}
+
+// What you were doing before you last stepped away. Shown while you are away
+// and for half an hour after you come back; after that it is old news.
+var RESUME_FOR = 1800
+
+function resume(data, now) {
+  var b = data && data.before_break
+  var s = (data && data.status) || {}
+  if (!b || !b.sessions || !b.sessions.length || !s.consent) return null
+  var fresh = !!s.away || (b.back_at && Number(now) - Number(b.back_at) <= RESUME_FOR)
+  if (!fresh) return null
+  var rows = []
+  for (var i = 0; i < b.sessions.length && rows.length < 3; i++) {
+    var x = b.sessions[i]
+    rows.push({
+      time: clock(x.started_at),
+      length: duration(x.active_seconds),
+      app: appName(x.app),
+      title: shortTitle(x.title, x.app, 56)
+    })
+  }
+  return { since: clock(b.away_at), away: b.away_seconds ? duration(b.away_seconds) : "", rows: rows }
+}
+
 function fileRows(data) {
   var rows = (data && data.files) || []
   var out = []
@@ -140,6 +179,8 @@ if (typeof module !== "undefined") {
     tooltip: tooltip,
     sessionRows: sessionRows,
     mediaRows: mediaRows,
+    pageRows: pageRows,
+    resume: resume,
     fileRows: fileRows,
     noteRows: noteRows,
     totalFocus: totalFocus
