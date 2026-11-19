@@ -58,7 +58,7 @@ fn kind_hint(word: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-const FILLER: [&str; 52] = [
+const FILLER: &[&str] = &[
     "a",
     "an",
     "the",
@@ -111,6 +111,16 @@ const FILLER: [&str; 52] = [
     "find",
     "remember",
     "had",
+    "have",
+    "has",
+    "been",
+    "just",
+    "last",
+    "latest",
+    "recent",
+    "recently",
+    "earlier",
+    "ago",
 ];
 
 /// "the rust talk I watched last tuesday" becomes: search "rust talk", in
@@ -692,6 +702,29 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}/v1")
+    }
+
+    #[test]
+    fn questions_split_into_terms_kinds_and_time() {
+        let now = 1_800_000_000.0;
+        let q = parse_recall(
+            "What was that YouTube video about async Rust I watched yesterday?",
+            now,
+        );
+        assert_eq!(q.terms, "youtube async rust");
+        assert_eq!(q.kinds, ["media", "page"]);
+        assert_eq!(q.range, timeutil::parse_range("yesterday", now));
+        // "the last article I read" asks for the most recent one, not for the word "last".
+        let q = parse_recall("the last article I read", now);
+        assert_eq!(
+            (q.terms.as_str(), q.kinds, q.range),
+            ("", vec!["page".to_string()], None)
+        );
+        let q = parse_recall("quarterly budget", now);
+        assert_eq!(
+            (q.terms.as_str(), q.kinds.len(), q.range),
+            ("quarterly budget", 0, None)
+        );
     }
 
     #[test]
