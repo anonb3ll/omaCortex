@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Lint
+        run: |
+          pip install ruff pytest
+          ruff check .
+          ruff format --check .
+      - name: Python tests
+        run: pytest
+      - name: Panel model tests
+        run: node --test tests/
+      - name: Manifest and i18n are valid JSON
+        run: |
+          python -c "import json; json.load(open('manifest.json')); json.load(open('i18n/en.json'))"
+      - name: CLI smoke test
+        env:
+          XDG_DATA_HOME: ${{ runner.temp }}/data
+          XDG_STATE_HOME: ${{ runner.temp }}/state
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
+          OMACORTEX_PYTHON: python3
+        run: |
+          bin/omacortex --version
+          bin/omacortex status
+          bin/omacortex panel-json | python -c "import json,sys; assert json.load(sys.stdin)['status']['consent'] is False"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+            | bin/omacortex mcp | python -c "import json,sys; r=[json.loads(l) for l in sys.stdin]; assert len(r[1]['result']['tools']) == 8"

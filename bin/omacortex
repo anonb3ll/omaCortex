@@ -1,0 +1,14 @@
+#!/bin/sh
+# omacortex launcher: runs the bundled Python package with the system Python
+# (Omarchy ships it). Works from the plugin folder or through a symlink.
+set -eu
+self=$(readlink -f "$0")
+root=$(dirname "$(dirname "$self")")
+PYTHON=${OMACORTEX_PYTHON:-/usr/bin/python3}
+[ -x "$PYTHON" ] || PYTHON=python3
+exec "$PYTHON" -I -c '
+import sys
+sys.path.insert(0, sys.argv.pop(1))
+from omacortex.cli import main
+sys.exit(main(sys.argv[1:]))
+' "$root/src" "$@"
