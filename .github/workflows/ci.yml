@@ -54,3 +54,73 @@ jobs:
           printf '\x1e\x00\x00\x00{"v":1,"type":"status"}       ' \
             | bin/omacortex chrome-extension://kifhcmopbipadknlobfmidehjfgamjdl/ | tail -c +5 | jq -e '.ok and .consent == false'
           ls -l target/release/omacortex
+
+  # Install the published release the way a machine without Rust does.
+  # Doctor is expected to miss Hyprland here; the job asserts that documented
+  # line instead of planting a socket.
+  fresh-install:
+    name: fresh user install from the latest release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install via install.sh --download into a clean home
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          home="${RUNNER_TEMP}/omacortex-home"
+          rm -rf "$home"
+          mkdir -p "$home"
+          export HOME="$home"
+          export XDG_CONFIG_HOME="$home/.config"
+          export XDG_DATA_HOME="$home/.local/share"
+          export XDG_STATE_HOME="$home/.local/state"
+          export XDG_CACHE_HOME="$home/.cache"
+          export XDG_RUNTIME_DIR="$home/runtime"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          unset HYPRLAND_INSTANCE_SIGNATURE || true
+          export PATH="$home/.local/bin:${PATH}"
+
+          latest=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" \
+            | jq -r '.tag_name')
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$latest"
+          test -n "$version"
+          # install.sh --download fetches the release whose tag matches Cargo.toml.
+          # That release has to be the latest one, or this is not a fresh-user install.
+          test "$latest" = "v${version}"
+
+          ./install.sh --download
+          test -x libexec/omacortex
+          test ! -e target/release/omacortex
+          test -L "$HOME/.local/bin/omacortex"
+          test -x "$HOME/.local/bin/omacortex"
+
+          version_out=$(omacortex --version)
+          printf '%s\n' "$version_out"
+          grep -F -q "omacortex ${version}" <<<"$version_out"
+
+          set +e
+          doctor_out=$(omacortex doctor)
+          doctor_code=$?
+          set -e
+          printf '%s\n' "$doctor_out"
+          # Checks are printed and the process exits 0. A missing compositor or
+          # media player is a failed line, not a crash, and this job does not
+          # invent a Hyprland socket or an MPRIS player.
+          test "$doctor_code" -eq 0
+          grep -q 'hyprland socket' <<<"$doctor_out"
+          grep -F -q 'no running Hyprland instance' <<<"$doctor_out"
+          grep -F -q "$XDG_DATA_HOME/omacortex/cortex.db" <<<"$doctor_out"
+          busctl_line=$(printf '%s\n' "$doctor_out" | grep -F 'busctl (media)')
+          test -n "$busctl_line"
+          if grep -q '^!!' <<<"$busctl_line"; then
+            grep -F -q 'missing' <<<"$busctl_line"
+          else
+            grep -F -q 'player(s)' <<<"$busctl_line"
+          fi
