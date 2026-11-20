@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "omaCortex",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Remembers the pages you read and watch by name, in omaCortex on this computer. Sends nothing over the network.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1JLijvk8Wq1G6E3mvogTZJvycJtNlzWz5EV8N9UzwhOlw9zFuZ2S1JqjPOjDEZ/VcG3doN49RCM1JWIE3DCgvUW0rPkwRR6A+d/VegdKObMmdbTpZmnmIa01B8bCg1ZpZ7o0vmybgYlvBva2bABBcqEHh8H3b54XBL1RonA/CLCWEs9UI9BVae/eohowi9dqTnXuTW4eu91gWqWUyxlRbOpUr9PLPsvpacDJMGsZskuFq0+RfvZamJ4OgaZRjhBd4BWwgYPTY+Li5efjZIASPbgeQy3tkvB55pooJt0s30zPCi2c+4xP9mqPmtRjeLU398GZW+MmmNVplAqUp2TTpwIDAQAB",
   "minimum_chrome_version": "116",
