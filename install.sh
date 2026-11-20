@@ -107,22 +107,77 @@ build() {
   (cd "$root" && cargo build --release --locked)
 }
 
+# Print a release version without its leading v, or fail. Only
+# MAJOR.MINOR.PATCH with an optional -PRERELEASE (dot-separated
+# [0-9A-Za-z-] identifiers) and an optional leading v is accepted, so a
+# version can never carry a path, a URL or shell syntax into a download.
+release_version() {
+  v=$1
+  [ "${#v}" -le 64 ] || return 1
+  case "$v" in
+    '' | *[!0-9A-Za-z.-]*) return 1 ;;
+  esac
+  # The case above already refused newlines, so grep sees one line.
+  printf '%s\n' "$v" |
+    LC_ALL=C grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' ||
+    return 1
+  printf '%s\n' "${v#v}"
+}
+
+# Print the URL the release assets are fetched from, or fail.
+# OMACORTEX_RELEASE_BASE exists for the install test fixture only: it must be
+# https on a loopback host, with plain path segments and no . or .. segment.
+release_base() {
+  if [ -z "${OMACORTEX_RELEASE_BASE+set}" ]; then
+    printf 'https://github.com/%s/releases/download/v%s\n' "$repo" "$version"
+    return 0
+  fi
+  b=$OMACORTEX_RELEASE_BASE
+  [ "${#b}" -le 256 ] || return 1
+  case "$b" in
+    *[!0-9A-Za-z./:_~-]*) return 1 ;;
+    https://*) ;;
+    *) return 1 ;;
+  esac
+  rest=${b#https://}
+  case "$rest/" in
+    */./* | */../*) return 1 ;;
+  esac
+  printf '%s\n' "$rest" |
+    LC_ALL=C grep -Eq '^(127\.0\.0\.1|localhost)(:[0-9]{1,5})?(/[0-9A-Za-z._~-]+)*$' ||
+    return 1
+  printf '%s\n' "$b"
+}
+
 download() {
-  version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
+  if [ -n "${OMACORTEX_INSTALL_VERSION+set}" ]; then
+    version=$(release_version "$OMACORTEX_INSTALL_VERSION") ||
+      die "OMACORTEX_INSTALL_VERSION must be a release version such as 1.2.3 or v1.2.3"
+  else
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
+    version=$(release_version "$version") ||
+      die "could not read a release version from Cargo.toml"
+  fi
   case "$(uname -m)" in
     x86_64|amd64) arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
     *) die "no prebuilt binary for $(uname -m); install Rust 1.89 or newer and run ./install.sh --build" ;;
   esac
   name="omacortex-$version-$arch-linux"
-  base="https://github.com/$repo/releases/download/v$version"
+  base=$(release_base) ||
+    die "OMACORTEX_RELEASE_BASE must be an https URL on 127.0.0.1 or localhost"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   say "Downloading $name.tar.gz from the v$version release..."
   curl -fsSL --proto '=https' -o "$tmp/$name.tar.gz" "$base/$name.tar.gz" || die "download failed ($base)"
   curl -fsSL --proto '=https' -o "$tmp/checksums.txt" "$base/checksums.txt" || die "checksums download failed"
-  expected=$(grep " \./$name.tar.gz\$\| $name.tar.gz\$" "$tmp/checksums.txt" | cut -d' ' -f1)
-  [ -n "$expected" ] || die "no checksum for $name.tar.gz"
+  # Exactly one line must name this archive, and its sum must be 64 hex
+  # digits. A missing, duplicated or malformed entry stops the install.
+  expected=$(awk -v n="$name.tar.gz" '$2 == n || $2 == "./" n { print $1 }' "$tmp/checksums.txt")
+  case "$expected" in
+    '' | *[!0-9a-f]*) die "no single sha256 checksum for $name.tar.gz" ;;
+  esac
+  [ "${#expected}" -eq 64 ] || die "no single sha256 checksum for $name.tar.gz"
   actual=$(sha256sum "$tmp/$name.tar.gz" | cut -d' ' -f1)
   [ "$expected" = "$actual" ] || die "checksum mismatch for $name.tar.gz"
   tar -xzf "$tmp/$name.tar.gz" -C "$tmp"

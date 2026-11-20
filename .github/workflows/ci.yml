@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fresh-install version resolution
+        run: scripts/fresh-install-version-test.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -91,11 +93,21 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           test -n "$latest"
           test -n "$version"
-          # install.sh --download fetches the release whose tag matches Cargo.toml.
-          # That release has to be the latest one, or this is not a fresh-user install.
-          test "$latest" = "v${version}"
+          tag_line=$(git ls-remote --tags origin "refs/tags/v${version}")
+          if [ -n "$tag_line" ]; then
+            tag_exists=yes
+          else
+            tag_exists=no
+          fi
+          # Unreleased pull requests install the latest published release.
+          # Pushes to main and tag refs still require that release to match Cargo.toml.
+          expected=$(scripts/fresh-install-version.sh \
+            "$GITHUB_EVENT_NAME" "$version" "$latest" "$tag_exists" "$GITHUB_REF")
+          test -n "$expected"
+          printf 'installing published release %s (checkout %s, event %s)\n' \
+            "$expected" "$version" "$GITHUB_EVENT_NAME"
 
-          ./install.sh --download
+          OMACORTEX_INSTALL_VERSION="$expected" ./install.sh --download
           test -x libexec/omacortex
           test ! -e target/release/omacortex
           test -L "$HOME/.local/bin/omacortex"
@@ -103,7 +115,7 @@ jobs:
 
           version_out=$(omacortex --version)
           printf '%s\n' "$version_out"
-          grep -F -q "omacortex ${version}" <<<"$version_out"
+          grep -F -q "omacortex ${expected}" <<<"$version_out"
 
           set +e
           doctor_out=$(omacortex doctor)
