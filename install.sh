@@ -108,14 +108,18 @@ build() {
 }
 
 download() {
-  version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
+  version=${OMACORTEX_INSTALL_VERSION:-}
+  if [ -z "$version" ]; then
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
+  fi
+  [ -n "$version" ] || die "could not read the version from Cargo.toml"
   case "$(uname -m)" in
     x86_64|amd64) arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
     *) die "no prebuilt binary for $(uname -m); install Rust 1.89 or newer and run ./install.sh --build" ;;
   esac
   name="omacortex-$version-$arch-linux"
-  base="https://github.com/$repo/releases/download/v$version"
+  base="${OMACORTEX_RELEASE_BASE:-https://github.com/$repo/releases/download/v$version}"
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   say "Downloading $name.tar.gz from the v$version release..."
