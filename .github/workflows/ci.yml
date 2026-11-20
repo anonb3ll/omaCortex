@@ -157,3 +157,22 @@ jobs:
           git cat-file -e "$BASE_SHA^{commit}" || git fetch --no-tags origin "$BASE_SHA"
           git cat-file -e "$HEAD_SHA^{commit}" || git fetch --no-tags origin "$HEAD_SHA"
           scripts/identity-gate.sh commits "$BASE_SHA" "$HEAD_SHA"
+      - name: Commits pushed to main
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+        run: |
+          # A push that creates the branch, or one that rewrote history, has no
+          # usable base: scan everything reachable from the new head instead.
+          root=$(git rev-list --max-parents=0 "$AFTER_SHA" | tail -n 1)
+          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null \
+             || ! git merge-base --is-ancestor "$BEFORE_SHA" "$AFTER_SHA"; then
+            scripts/identity-gate.sh commits "$root" "$AFTER_SHA"
+            git log -1 --format='%ae%n%ce' "$root" | while read -r who; do
+              case "$who" in anonb3ll@pm.me|*@users.noreply.github.com|noreply@github.com) ;; *) echo "root commit identity not allowed"; exit 1;; esac
+            done
+          else
+            scripts/identity-gate.sh commits "$BEFORE_SHA" "$AFTER_SHA"
+          fi
