@@ -250,7 +250,8 @@ node --test tests/model.test.js tests/extension.test.mjs
 ```
 
 `tests/e2e-browser.mjs` loads the extension in a real Chromium and checks that
-a page shows up in `omacortex recall`. It is not part of CI. It needs
+a page shows up in `omacortex recall`. CI runs it in its own `e2e-browser`
+job. It needs
 `chromium` on `PATH` (or `CHROMIUM` set to the binary) and a built recorder:
 
 ```bash
