@@ -59,9 +59,13 @@ omarchy plugin add https://github.com/anonb3ll/omaCortex --enable
 
 This adds the bar icon. The recorder itself is a small Rust binary, so the
 first time you open the panel it offers **Install recorder**, which runs
-`install.sh` in a terminal: it builds with `cargo` if you have Rust
-(`sudo pacman -S rust`), otherwise it downloads the release binary for your
-architecture and checks its sha256. Then press **Start recording**.
+`install.sh` in a terminal. If `cargo` is on `PATH` it builds. That build
+needs Rust 1.89 or newer and a C compiler (`cc`, `gcc`, or `clang`), because
+SQLite is compiled in, and it stops with install advice when either is
+missing. Otherwise it downloads the release binary for your architecture and
+checks its sha256. Examples: `sudo pacman -S rust base-devel`,
+`sudo apt install rustc cargo build-essential`,
+`sudo dnf install rust cargo gcc`. Then press **Start recording**.
 
 Or do both steps from a terminal:
 
@@ -138,7 +142,7 @@ at the top of [`src/browser.rs`](src/browser.rs).
 | `omacortex forget --last 15m` | Delete recent activity |
 | `omacortex export > history.jsonl` | Everything, as JSON lines |
 | `omacortex browser install` / `status` / `uninstall` | Connect a browser so pages are remembered |
-| `omacortex doctor` | Check sensors, model and permissions |
+| `omacortex doctor` | Check sensors, model and permissions. A failed line points at [Requirements and troubleshooting](#requirements-and-troubleshooting) |
 
 Every read command takes `--json`.
 
@@ -208,6 +212,155 @@ add apps, title patterns, workspaces or paths to never record, change
 retention, or point at a specific model. A config file that fails to parse
 is reported by `status` and `doctor`, and the defaults stay in force.
 
+## Requirements and troubleshooting
+
+omaCortex targets [Omarchy](https://omarchy.org) on Hyprland. The recorder is
+an ordinary program, so the same binary runs on another Linux system. What
+you give up off Omarchy is the bar panel and the shell's idle monitor, which
+is what marks you away and back.
+
+<a id="requirements-without-omarchy"></a>
+
+### Without Omarchy
+
+`install.sh` links `omacortex` into `~/.local/bin`. Use `install.sh --download`
+for the release binary, or `install.sh --build` when Rust is installed.
+`install.sh --systemd` runs the recorder as a user service when you are not
+loading the shell plugin. A lock file still keeps a single recorder per user.
+
+Media needs `busctl` from systemd. Files come from the freedesktop
+recently-used list, which GTK and Qt applications write on other desktops
+too. Window titles need Hyprland, below. Everything else (notes, search,
+`recall`, export, MCP) needs neither Omarchy nor a compositor.
+
+`omacortex doctor` prints one line per check and exits 0. A line that starts
+with `!!` is a failed check, not a crash. The detail ends with `README#...`,
+the anchor of the matching subsection here.
+
+<a id="troubleshooting-hyprland"></a>
+
+### No Hyprland
+
+Window titles come from Hyprland's event socket,
+`$XDG_RUNTIME_DIR/hypr/<instance>/.socket2.sock`. On another compositor, or
+when Hyprland is not running, doctor reports:
+
+```
+!!  hyprland socket        no running Hyprland instance (README#troubleshooting-hyprland)
+```
+
+Media, files, browser pages and notes still record. There is no window
+history until a Hyprland session is up. A daemon started before Hyprland
+reconnects when the socket appears. To skip the sensor, set
+`capture.windows = false`.
+
+<a id="troubleshooting-busctl"></a>
+
+### No MPRIS (`busctl` missing)
+
+What is playing is read with `busctl` (systemd), which Omarchy ships. If
+that program is not on `PATH`, doctor reports `missing`:
+
+```
+!!  busctl (media)         missing (README#troubleshooting-busctl)
+```
+
+Install the systemd package that provides `busctl`, or set
+`capture.media = false`. When `busctl` is installed and nothing is playing,
+the check passes and shows `0 player(s) on the bus`.
+
+<a id="troubleshooting-browser"></a>
+
+### Firefox and other browsers
+
+Page capture speaks Chromium's native messaging. Chromium, Chrome, Brave,
+Vivaldi and Edge work, after `omacortex browser install` and loading the
+unpacked extension. Firefox is not supported: its native-messaging hosts
+live in a different directory and use a different manifest, and omaCortex
+does not install one. Doctor will not list Firefox. With no Chromium-family
+browser connected it reports:
+
+```
+!!  browser pages          optional: run `omacortex browser install` (README#troubleshooting-browser)
+```
+
+Pages are optional. Sessions, media, files, notes and search do not need a
+browser.
+
+<a id="troubleshooting-no-local-model"></a>
+
+### No local model
+
+`summarize`, `ask` and the panel's *Summarize today* are the only commands
+that call a model. With none running, doctor reports a `local model` line
+whose detail starts with `optional:`:
+
+```
+!!  local model            optional: no local model answered (…) (README#troubleshooting-no-local-model)
+```
+
+`summarize` then prints a structured digest. `ask` exits with
+`no local model`. `now`, `recall`, `search`, `sessions` and the other MCP
+tools keep working. Start one of the servers in [Local model](#local-model),
+or set `endpoint` in the config. `endpoint = "off"` records that choice and
+skips the probes.
+
+<a id="troubleshooting-config"></a>
+
+### Config file does not parse
+
+A `config.toml` that is not valid TOML is ignored. Defaults stay in force,
+so a typo cannot widen what is recorded. Doctor's `config` line shows the
+parse error, then `README#troubleshooting-config`. Fix the file, or move it
+aside and run `omacortex config --init`.
+
+<a id="troubleshooting-privacy-patterns"></a>
+
+### Privacy patterns do not compile
+
+`privacy.exclude_titles` entries are regular expressions. Doctor's
+`privacy patterns` line lists any that do not compile, then
+`README#troubleshooting-privacy-patterns`. A pattern that failed to compile
+matches nothing, so a window you meant to exclude can be recorded. Quote
+patterns as TOML strings; the example config is a working set.
+
+<a id="troubleshooting-consent"></a>
+
+### Not enabled
+
+Nothing is recorded until you run `omacortex enable` or press *Start
+recording*. Until then doctor reports:
+
+```
+!!  consent                run `omacortex enable` (README#troubleshooting-consent)
+```
+
+History you already have is kept across `disable` and `enable`.
+
+<a id="troubleshooting-daemon"></a>
+
+### Daemon is not running
+
+Doctor reports `not running` when the recorder process is absent:
+
+```
+!!  daemon                 not running (README#troubleshooting-daemon)
+```
+
+With the shell plugin, open the panel or reload plugins. Without it, use
+`install.sh --systemd` or `omacortex daemon`. `omacortex status` shows the
+same fact.
+
+<a id="troubleshooting-database-permissions"></a>
+
+### Database permissions
+
+The database file must be mode `0600` (and its directory `0700`). Doctor
+prints the path and the mode it found. When the mode is anything else the
+line ends with `README#troubleshooting-database-permissions`. omaCortex
+creates the file with those permissions itself; if something else rewrote
+it, `chmod 600` that path.
+
 ## How it works
 
 ```
@@ -235,10 +388,28 @@ stack and no D-Bus library. The database schema is the same one 0.1 wrote.
 
 ## Develop
 
+Building and the tests need Rust 1.89 or newer and a C compiler (`cc`, `gcc`,
+or `clang`). These are the same checks CI runs:
+
 ```bash
-cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo test
-node --test tests/model.test.js
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+node --test tests/model.test.js tests/extension.test.mjs
+```
+
+`tests/e2e-browser.mjs` loads the extension in a real Chromium and checks that
+a page shows up in `omacortex recall`. CI runs it in its own `e2e-browser`
+job. It needs
+`chromium` on `PATH` (or `CHROMIUM` set to the binary) and a built recorder:
+
+```bash
+cargo build && node tests/e2e-browser.mjs
+```
+
+These two commands are Omarchy-only:
+
+```bash
 omarchy plugin validate .
 omarchy agent look plugin .
 ```

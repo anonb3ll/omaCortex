@@ -4,6 +4,7 @@
 //
 // Not part of `cargo test`: it needs chromium and takes about a minute.
 //   cargo build && node tests/e2e-browser.mjs
+// CI runs it with the release binary. CHROMIUM_ARGS adds runner-only flags.
 // Everything lives in a temporary directory; your own omaCortex data, browser
 // profile and native-messaging hosts are not touched. Chromium runs headless.
 import { spawn, execFileSync } from "node:child_process"
@@ -16,6 +17,7 @@ import { fileURLToPath } from "node:url"
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const binary = process.env.OMACORTEX_BIN || join(root, "target/debug/omacortex")
 const chromium = process.env.CHROMIUM || "chromium"
+const chromiumArgs = (process.env.CHROMIUM_ARGS || "").split(/\s+/).filter(Boolean)
 const tmp = mkdtempSync(join(tmpdir(), "omacortex-e2e-"))
 const env = Object.assign({}, process.env, {
   XDG_CONFIG_HOME: join(tmp, "config"),
@@ -81,6 +83,7 @@ async function main() {
       "--disable-extensions-except=" + extension,
       "--disable-features=DisableLoadExtensionCommandLineSwitch",
       "--remote-debugging-port=0",
+      ...chromiumArgs,
       "about:blank"
     ],
     { env, stdio: ["ignore", "ignore", "pipe"] }

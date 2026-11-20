@@ -10,6 +10,7 @@
 #                              (only if you do not enable the shell plugin)
 #   ./install.sh --uninstall
 #
+# Building needs Rust 1.89 or newer and a C compiler (cc, gcc, or clang).
 # It never grants consent: recording starts only after `omacortex enable`.
 set -eu
 
@@ -45,12 +46,63 @@ for arg in "$@"; do
     --build) mode=build ;;
     --download) mode=download ;;
     --systemd) systemd=yes ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) die "unknown option: $arg" ;;
   esac
 done
 
+tool_advice() {
+  cat <<EOF
+Install Rust 1.89 or newer (https://rustup.rs) and a C compiler. Examples:
+  sudo pacman -S rust base-devel
+  sudo apt install rustc cargo build-essential
+  sudo dnf install rust cargo gcc
+Or skip the build and use the release binary: ./install.sh --download
+EOF
+}
+
+require_build_tools() {
+  if ! command -v rustc >/dev/null 2>&1; then
+    printf 'install.sh: rustc was not found. Building needs Rust 1.89 or newer.\n' >&2
+    tool_advice >&2
+    exit 1
+  fi
+  ver=$(rustc --version | sed -n 's/^rustc \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p' | head -n 1)
+  if [ -z "$ver" ]; then
+    printf 'install.sh: could not read the rustc version. Building needs Rust 1.89 or newer.\n' >&2
+    tool_advice >&2
+    exit 1
+  fi
+  major=${ver%% *}
+  minor=${ver#* }
+  too_old=0
+  if [ "$major" -lt 1 ]; then
+    too_old=1
+  elif [ "$major" -eq 1 ] && [ "$minor" -lt 89 ]; then
+    too_old=1
+  fi
+  if [ "$too_old" -eq 1 ]; then
+    printf 'install.sh: rustc %s.%s is too old. Building needs Rust 1.89 or newer.\n' "$major" "$minor" >&2
+    tool_advice >&2
+    exit 1
+  fi
+  compiler=${CC:-}
+  if [ -n "$compiler" ]; then
+    if ! command -v "$compiler" >/dev/null 2>&1; then
+      printf 'install.sh: CC=%s was not found.\n' "$compiler" >&2
+      tool_advice >&2
+      exit 1
+    fi
+  elif ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+    printf 'install.sh: no C compiler found (cc, gcc, or clang).\n' >&2
+    printf 'install.sh: the build compiles the bundled SQLite sources.\n' >&2
+    tool_advice >&2
+    exit 1
+  fi
+}
+
 build() {
+  require_build_tools
   say "Building omacortex with cargo (a minute or two the first time)..."
   (cd "$root" && cargo build --release --locked)
 }
@@ -60,7 +112,7 @@ download() {
   case "$(uname -m)" in
     x86_64|amd64) arch=x86_64 ;;
     aarch64|arm64) arch=aarch64 ;;
-    *) die "no prebuilt binary for $(uname -m); install rust (sudo pacman -S rust) and run ./install.sh --build" ;;
+    *) die "no prebuilt binary for $(uname -m); install Rust 1.89 or newer and run ./install.sh --build" ;;
   esac
   name="omacortex-$version-$arch-linux"
   base="https://github.com/$repo/releases/download/v$version"
@@ -80,7 +132,14 @@ download() {
 }
 
 case "$mode" in
-  build) command -v cargo >/dev/null 2>&1 || die "cargo not found (sudo pacman -S rust)"; build ;;
+  build)
+    if ! command -v cargo >/dev/null 2>&1; then
+      printf 'install.sh: cargo was not found.\n' >&2
+      tool_advice >&2
+      exit 1
+    fi
+    build
+    ;;
   download) download ;;
   auto) if command -v cargo >/dev/null 2>&1; then build; else download; fi ;;
 esac
@@ -98,7 +157,9 @@ if [ "$systemd" = yes ]; then
 fi
 
 # If the shell plugin is loaded, let it start the freshly installed recorder.
-command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell shell reloadPlugins >/dev/null 2>&1 || true
+if command -v omarchy-shell >/dev/null 2>&1; then
+  omarchy-shell shell reloadPlugins >/dev/null 2>&1 || true
+fi
 
 "$root/bin/omacortex" --version
 cat <<EOF
