@@ -124,3 +124,24 @@ jobs:
           else
             grep -F -q 'player(s)' <<<"$busctl_line"
           fi
+
+  identity:
+    name: identity gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fixture rejects a planted Gmail commit
+        run: scripts/identity-gate-test.sh
+      - name: Tracked files
+        run: scripts/identity-gate.sh files
+      - name: New commits only
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git cat-file -e "$BASE_SHA^{commit}" || git fetch --no-tags origin "$BASE_SHA"
+          git cat-file -e "$HEAD_SHA^{commit}" || git fetch --no-tags origin "$HEAD_SHA"
+          scripts/identity-gate.sh commits "$BASE_SHA" "$HEAD_SHA"

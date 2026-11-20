@@ -30,7 +30,7 @@ jobs:
           dir="$APP-$ver-$ARCH-linux"
           mkdir -p "dist/$dir/bin"
           install -m755 "target/release/$APP" "dist/$dir/bin/$APP"
-          cp LICENSE README.md PRIVACY.md "dist/$dir/"
+          cp LICENSE NOTICE README.md PRIVACY.md "dist/$dir/"
           tar -C dist -czf "dist/$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v4
         with:
