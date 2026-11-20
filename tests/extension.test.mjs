@@ -9,6 +9,79 @@ const { readMeta } = globalThis.__omacortexTest
 const T0 = 1_800_000_000_000
 const page = (tabId, url, title) => ({ tabId, url, title })
 
+test("the companion retries the same visit and discards reports the host fenced", async (t) => {
+  const listeners = {}
+  const event = name => ({ addListener: fn => { listeners[name] = fn } })
+  let now = T0
+  let tab = { id: 1, url: "https://example.com/one", title: "One" }
+  let enabled = true
+  const session = {}
+  const attempts = []
+  let respond
+  t.mock.method(Date, "now", () => now)
+  globalThis.chrome = {
+    storage: {
+      onChanged: event("setting"),
+      local: { get: async () => ({ enabled }) },
+      session: {
+        get: async () => structuredClone(session),
+        set: async values => Object.assign(session, structuredClone(values))
+      }
+    },
+    windows: { onFocusChanged: event("focus"), getLastFocused: async () => ({ id: 1, focused: true }) },
+    tabs: {
+      onActivated: event("activate"), onRemoved: event("removed"), onUpdated: event("updated"),
+      query: async () => [tab], sendMessage: async () => null
+    },
+    idle: { onStateChanged: event("idle"), queryState: async () => "active" },
+    alarms: { onAlarm: event("alarm"), get: async () => ({}) },
+    runtime: {
+      onInstalled: event("install"), onStartup: event("startup"),
+      sendNativeMessage: async (_host, message) => {
+        attempts.push(message)
+        return respond()
+      }
+    }
+  }
+  t.after(() => { delete globalThis.chrome })
+
+  await import("../extension/background.js")
+  await listeners.activate()
+  now += 15_000
+  tab = { id: 2, url: "https://example.com/two", title: "Two" }
+  respond = () => { throw new Error("native pipe unavailable") }
+  await listeners.activate()
+  assert.equal(session.pending.length, 1)
+  await listeners.activate()
+  assert.equal(attempts.length, 1, "tab events respect retry backoff")
+
+  now += 5_000
+  respond = () => ({ ok: true, stored: true, recording: true })
+  await import("../extension/background.js?restart")
+  await listeners.activate()
+  assert.deepEqual(attempts[0], attempts[1], "retry preserves the visit identity after worker restart")
+  assert.equal(session.pending.length, 0)
+
+  now += 15_000
+  respond = () => ({ ok: true, stored: false, recording: true, reason: "before recording resumed", recording_since: (now - 1_000) / 1000 })
+  listeners.alarm({ name: "omacortex-tick" })
+  await listeners.activate()
+  assert.equal(session.pending.length, 0, "the host's privacy fence is terminal")
+  assert.equal(session.state.visit.at, now / 1000, "the open tab starts a fresh visit")
+
+  now += 15_000
+  respond = () => ({ ok: true, stored: false, retryable: true, recording: true, reason: "store error" })
+  tab = { id: 3, url: "https://example.com/three", title: "Three" }
+  await listeners.activate()
+  assert.equal(session.pending.length, 1, "the host can request retry after a temporary store error")
+  enabled = false
+  now += 5_000
+  const sent = attempts.length
+  await listeners.activate()
+  assert.equal(session.pending.length, 0, "opt-out deletes pending page metadata")
+  assert.equal(attempts.length, sent)
+})
+
 test("addresses lose queries, fragments and credentials", () => {
   assert.equal(Visit.minimizeUrl("https://user:pw@example.com:8443/a/b?utm=1&q=secret#frag"), "https://example.com:8443/a/b")
   assert.equal(Visit.minimizeUrl("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s&list=PL1"), "https://www.youtube.com/watch?v=dQw4w9WgXcQ")

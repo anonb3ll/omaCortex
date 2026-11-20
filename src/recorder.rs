@@ -261,7 +261,8 @@ impl Recorder {
     /// address must be a web page on a host that is not excluded, the title
     /// must pass the same rules as a window title, and every field is cleaned.
     pub fn page(&self, page: &Page, min_seconds: f64) -> PageOutcome {
-        if !self.state.read().recording() {
+        let recording = self.state.read();
+        if !recording.recording() {
             return PageOutcome::Skipped("paused");
         }
         let Some(host) = crate::privacy::host_of(&page.url) else {
@@ -280,6 +281,9 @@ impl Recorder {
             Some(at) if at.is_finite() && at > 0.0 && at <= now + 60.0 => at.min(now),
             _ => now - seconds,
         };
+        if at < recording.recording_since {
+            return PageOutcome::Skipped("before recording resumed");
+        }
         let title = self.privacy.clean(&page.title);
         let Some(url) = self.privacy.clean_url(&page.url) else {
             return PageOutcome::Skipped("not a web page");
@@ -312,7 +316,8 @@ impl Recorder {
             seconds,
         };
         match self.store.upsert_page(&visit) {
-            Ok((id, _)) => PageOutcome::Stored(id),
+            Ok(Some(id)) => PageOutcome::Stored(id),
+            Ok(None) => PageOutcome::Skipped("visit forgotten"),
             Err(_) => PageOutcome::Skipped("store error"),
         }
     }

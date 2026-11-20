@@ -46,6 +46,7 @@ pub struct RecordingState {
     pub consent: bool,
     pub paused: bool,
     pub paused_until: Option<f64>,
+    pub recording_since: f64,
 }
 
 impl RecordingState {
@@ -66,18 +67,22 @@ impl State {
     }
 
     pub fn read(&self) -> RecordingState {
-        let consent = read(&self.paths.consent_file())["granted"] == json!(true);
+        let consent = read(&self.paths.consent_file());
         let pause = read(&self.paths.pause_file());
         let mut paused = pause["paused"] == json!(true);
-        let mut until = pause["until"].as_f64();
+        let until = pause["until"].as_f64();
+        let mut recording_since = consent["at"].as_f64().unwrap_or_default();
         if paused && until.is_some_and(|u| u <= (self.clock)()) {
             paused = false;
-            until = None;
+            recording_since = recording_since.max(until.unwrap_or_default());
+        } else if !paused {
+            recording_since = recording_since.max(pause["at"].as_f64().unwrap_or_default());
         }
         RecordingState {
-            consent,
+            consent: consent["granted"] == json!(true),
             paused,
             paused_until: if paused { until } else { None },
+            recording_since,
         }
     }
 
