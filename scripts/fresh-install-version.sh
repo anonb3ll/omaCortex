@@ -8,7 +8,18 @@
 # A pull request whose version tag does not exist yet gets the latest release.
 # Every other event, and any refs/tags/* ref, requires latest-tag to be
 # v<cargo-version> and prints the checkout version.
+# cargo-version must be MAJOR.MINOR.PATCH[-PRERELEASE] and latest-tag must be
+# v followed by one, so the printed version is always safe to put in a URL.
 set -eu
+
+# 0 when $1 is MAJOR.MINOR.PATCH with an optional -PRERELEASE.
+is_release_version() {
+  case "$1" in
+    '' | *[!0-9A-Za-z.-]*) return 1 ;;
+  esac
+  printf '%s\n' "$1" |
+    LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+}
 
 if [ "$#" -ne 5 ]; then
   printf 'usage: fresh-install-version.sh <event> <cargo-version> <latest-tag> <tag-exists> <ref>\n' >&2
@@ -34,6 +45,19 @@ if [ -z "$version" ] || [ -z "$latest" ] || [ "$latest" = "null" ]; then
   exit 1
 fi
 
+if ! is_release_version "$version"; then
+  printf 'fresh-install-version: checkout version is not MAJOR.MINOR.PATCH[-PRERELEASE]\n' >&2
+  exit 1
+fi
+case "$latest" in
+  v*) latest_ok=yes ;;
+  *) latest_ok=no ;;
+esac
+if [ "$latest_ok" = "no" ] || ! is_release_version "${latest#v}"; then
+  printf 'fresh-install: latest release tag is not v<MAJOR.MINOR.PATCH[-PRERELEASE]>\n' >&2
+  exit 1
+fi
+
 strict=yes
 if [ "$event" = "pull_request" ] && [ "$tag_exists" = "no" ]; then
   strict=no
@@ -51,10 +75,4 @@ if [ "$strict" = "yes" ]; then
   exit 0
 fi
 
-case "$latest" in
-  v*) printf '%s\n' "${latest#v}" ;;
-  *)
-    printf 'fresh-install: latest release tag %s has no v prefix\n' "$latest" >&2
-    exit 1
-    ;;
-esac
+printf '%s\n' "${latest#v}"
