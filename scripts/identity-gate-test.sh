@@ -73,7 +73,7 @@ output=$("$gate" commits "$base" "$sha" "$repo" 2>&1)
 code=$?
 set -e
 assert_rejected 'planted Gmail author' "$output" "$code" "$sha" "$secret"
-printf '%s\n' "$output" | grep -q 'forbidden @gmail.com address' || fail 'planted Gmail author had no category'
+printf '%s\n' "$output" | grep -q 'forbidden gmail address' || fail 'planted Gmail author had no category'
 
 # The same address in a Co-authored-by trailer is rejected.
 repo=$work/trailer

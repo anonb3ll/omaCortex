@@ -76,7 +76,7 @@ classify() {
     return 0
   fi
   if printf '%s' "$value" | grep -qiE "$(mail_re)"; then
-    printf '%s\n' 'forbidden @gmail.com address'
+    printf '%s\n' 'forbidden gmail address'
     return 0
   fi
   return 1
