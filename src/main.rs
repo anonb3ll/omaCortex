@@ -353,6 +353,120 @@ fn kinds(k: &[Kind]) -> Vec<String> {
     k.iter().map(|k| k.name().to_string()).collect()
 }
 
+/// The one-line recording state printed by `omacortex status`.
+fn recording_status_line(
+    consent: bool,
+    paused: bool,
+    paused_until: Option<f64>,
+    away: bool,
+) -> String {
+    if !consent {
+        "off: not enabled yet (run `omacortex enable`)".to_string()
+    } else if paused {
+        match paused_until {
+            Some(t) => format!("paused until {}", clock(t)),
+            None => "paused".into(),
+        }
+    } else if away {
+        "recording (you are away)".into()
+    } else {
+        "recording".into()
+    }
+}
+
+fn enabled_sensors(windows: bool, media: bool, files: bool, browser: bool) -> String {
+    let on: Vec<&str> = [
+        ("windows", windows),
+        ("media", media),
+        ("files", files),
+        ("browser", browser),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(name, _)| name)
+    .collect();
+    if on.is_empty() {
+        "none".into()
+    } else {
+        on.join(", ")
+    }
+}
+
+fn retention_phrase(days: Option<u64>) -> String {
+    match days {
+        Some(0) | None => "forever".to_string(),
+        Some(d) => format!("{d} days"),
+    }
+}
+
+struct ForgetPlan {
+    scope: String,
+    start: Option<f64>,
+    end: Option<f64>,
+    app: Option<String>,
+    everything: bool,
+}
+
+enum ForgetChoice {
+    Ready(ForgetPlan),
+    MissingTarget,
+}
+
+/// What `forget` will delete. `--all` wins over every other filter.
+fn plan_forget(
+    now: f64,
+    last: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    app: Option<String>,
+    all: bool,
+) -> Result<ForgetChoice, String> {
+    if all {
+        return Ok(ForgetChoice::Ready(ForgetPlan {
+            scope: "everything omaCortex has recorded".to_string(),
+            start: None,
+            end: None,
+            app: None,
+            everything: true,
+        }));
+    }
+    if let Some(last) = last {
+        let secs = parse_duration(last)?;
+        return Ok(ForgetChoice::Ready(ForgetPlan {
+            scope: format!("the last {}", human_duration(secs)),
+            start: Some(now - secs),
+            end: None,
+            app: None,
+            everything: false,
+        }));
+    }
+    if since.is_some() || until.is_some() || app.is_some() {
+        return Ok(ForgetChoice::Ready(ForgetPlan {
+            scope: "matching activity".into(),
+            start: parse_when(since, now)?,
+            end: parse_when(until, now)?,
+            app,
+            everything: false,
+        }));
+    }
+    Ok(ForgetChoice::MissingTarget)
+}
+
+fn browser_connection_line(
+    installed: bool,
+    program_ok: bool,
+    program: &str,
+    extensions: usize,
+) -> String {
+    if !installed {
+        "not connected (run `omacortex browser install`)".to_string()
+    } else if !program_ok {
+        format!("connected, but {program} is missing; reinstall")
+    } else {
+        format!("connected for {extensions} extension(s)")
+    }
+}
+
 /// Tell a running daemon to re-read state now; fine if none is running.
 fn poke(cfg: &Config) {
     let _ = daemon::send_control(cfg, "refresh");
@@ -371,18 +485,12 @@ fn run(cmd: Cmd) -> Res<i32> {
                 print_json(&s);
                 return Ok(0);
             }
-            let state = if s["consent"] != true {
-                "off: not enabled yet (run `omacortex enable`)".to_string()
-            } else if s["paused"] == true {
-                match s["paused_until"].as_f64() {
-                    Some(t) => format!("paused until {}", clock(t)),
-                    None => "paused".into(),
-                }
-            } else if s["away"] == true {
-                "recording (you are away)".into()
-            } else {
-                "recording".into()
-            };
+            let state = recording_status_line(
+                s["consent"] == true,
+                s["paused"] == true,
+                s["paused_until"].as_f64(),
+                s["away"] == true,
+            );
             println!("omaCortex {}: {state}", s["version"].as_str().unwrap_or(""));
             println!(
                 "daemon: {}",
@@ -392,17 +500,14 @@ fn run(cmd: Cmd) -> Res<i32> {
                     "not running"
                 }
             );
-            let on: Vec<&str> = ["windows", "media", "files", "browser"]
-                .into_iter()
-                .filter(|k| s["sources"][k] == true)
-                .collect();
             println!(
                 "sensors: {}",
-                if on.is_empty() {
-                    "none".into()
-                } else {
-                    on.join(", ")
-                }
+                enabled_sensors(
+                    s["sources"]["windows"] == true,
+                    s["sources"]["media"] == true,
+                    s["sources"]["files"] == true,
+                    s["sources"]["browser"] == true,
+                )
             );
             let rows: i64 = s["rows"]
                 .as_object()
@@ -413,14 +518,10 @@ fn run(cmd: Cmd) -> Res<i32> {
                 s["db_bytes"].as_u64().unwrap_or(0) / 1024,
                 s["oldest"].as_str().unwrap_or("-")
             );
-            let days = |key: &str| match s[key].as_u64() {
-                Some(0) | None => "forever".to_string(),
-                Some(d) => format!("{d} days"),
-            };
             println!(
                 "retention: window history {}, library (media, pages, files, notes) {}",
-                days("retention_days"),
-                days("library_days")
+                retention_phrase(s["retention_days"].as_u64()),
+                retention_phrase(s["library_days"].as_u64())
             );
             if let Some(e) = s["config_error"].as_str().filter(|e| !e.is_empty()) {
                 println!("config error (defaults in use): {e}");
@@ -779,41 +880,28 @@ fn run(cmd: Cmd) -> Res<i32> {
         } => {
             let c = open()?;
             let now = c.now_ts();
-            let (scope, start, end, app, everything) = if all {
-                (
-                    "everything omaCortex has recorded".to_string(),
-                    None,
-                    None,
-                    None,
-                    true,
-                )
-            } else if let Some(l) = last {
-                let secs = parse_duration(&l)?;
-                (
-                    format!("the last {}", human_duration(secs)),
-                    Some(now - secs),
-                    None,
-                    None,
-                    false,
-                )
-            } else if since.is_some() || until.is_some() || app.is_some() {
-                (
-                    "matching activity".into(),
-                    parse_when(since.as_deref(), now)?,
-                    parse_when(until.as_deref(), now)?,
-                    app,
-                    false,
-                )
-            } else {
-                eprintln!("say what to forget: --last 15m, --since/--until, --app NAME, or --all");
-                return Ok(2);
+            let plan = match plan_forget(
+                now,
+                last.as_deref(),
+                since.as_deref(),
+                until.as_deref(),
+                app,
+                all,
+            )? {
+                ForgetChoice::MissingTarget => {
+                    eprintln!(
+                        "say what to forget: --last 15m, --since/--until, --app NAME, or --all"
+                    );
+                    return Ok(2);
+                }
+                ForgetChoice::Ready(plan) => plan,
             };
             if !yes {
                 if !std::io::stdin().is_terminal() {
                     eprintln!("refusing without --yes when not interactive");
                     return Ok(2);
                 }
-                eprint!("Delete {scope}? This cannot be undone. [y/N] ");
+                eprint!("Delete {}? This cannot be undone. [y/N] ", plan.scope);
                 let mut answer = String::new();
                 std::io::stdin().read_line(&mut answer)?;
                 if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
@@ -821,7 +909,9 @@ fn run(cmd: Cmd) -> Res<i32> {
                     return Ok(1);
                 }
             }
-            let n = c.store.forget(start, end, app.as_deref(), everything)?;
+            let n = c
+                .store
+                .forget(plan.start, plan.end, plan.app.as_deref(), plan.everything)?;
             println!("forgot {n} row(s)");
             Ok(0)
         }
@@ -969,13 +1059,12 @@ fn browser_command(action: BrowserCmd) -> Res<i32> {
                 return Ok(0);
             }
             for s in all.iter().filter(|s| s.present || s.installed) {
-                let state = if !s.installed {
-                    "not connected (run `omacortex browser install`)".to_string()
-                } else if !s.program_ok {
-                    format!("connected, but {} is missing; reinstall", s.program)
-                } else {
-                    format!("connected for {} extension(s)", s.extensions.len())
-                };
+                let state = browser_connection_line(
+                    s.installed,
+                    s.program_ok,
+                    &s.program,
+                    s.extensions.len(),
+                );
                 println!("{:<9} {state}", s.browser);
             }
             if !all.iter().any(|s| s.present || s.installed) {
@@ -1185,6 +1274,215 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: f64 = 1_800_000_000.0;
+
+    fn row(kind: &str, app: &str, title: &str, seconds: f64, ongoing: bool) -> Row {
+        Row {
+            id: 1,
+            kind: kind.into(),
+            source: "test".into(),
+            app: app.into(),
+            title: title.into(),
+            detail: String::new(),
+            started_at: NOW,
+            ended_at: NOW,
+            ongoing,
+            seconds,
+        }
+    }
+
+    fn item(kind: &str) -> Item {
+        Item {
+            kind: kind.into(),
+            title: "Rates".into(),
+            app: "chromium".into(),
+            site: String::new(),
+            creator: String::new(),
+            location: String::new(),
+            content: String::new(),
+            first_seen: NOW,
+            last_seen: NOW,
+            seconds: 90.0,
+            times: 1,
+            last_id: 7,
+        }
+    }
+
+    #[test]
+    fn kind_names_are_the_stored_labels() {
+        assert_eq!(
+            kinds(&[
+                Kind::Focus,
+                Kind::Media,
+                Kind::Page,
+                Kind::File,
+                Kind::Note,
+                Kind::Marker
+            ]),
+            vec!["focus", "media", "page", "file", "note", "marker"]
+        );
+        assert!(kinds(&[]).is_empty());
+    }
+
+    #[test]
+    fn status_line_prefers_consent_then_pause_then_away() {
+        assert_eq!(
+            recording_status_line(false, true, Some(NOW), true),
+            "off: not enabled yet (run `omacortex enable`)"
+        );
+        assert_eq!(recording_status_line(true, true, None, true), "paused");
+        assert_eq!(
+            recording_status_line(true, true, Some(NOW), false),
+            format!("paused until {}", clock(NOW))
+        );
+        assert_eq!(
+            recording_status_line(true, false, None, true),
+            "recording (you are away)"
+        );
+        assert_eq!(recording_status_line(true, false, None, false), "recording");
+    }
+
+    #[test]
+    fn sensor_and_retention_phrases() {
+        assert_eq!(enabled_sensors(false, false, false, false), "none");
+        assert_eq!(
+            enabled_sensors(true, false, true, true),
+            "windows, files, browser"
+        );
+        assert_eq!(
+            enabled_sensors(true, true, true, true),
+            "windows, media, files, browser"
+        );
+        assert_eq!(retention_phrase(None), "forever");
+        assert_eq!(retention_phrase(Some(0)), "forever");
+        assert_eq!(retention_phrase(Some(30)), "30 days");
+    }
+
+    #[test]
+    fn row_lines_drop_duration_for_point_events() {
+        let stamp = timeutil::stamp(NOW);
+        let focus = row("focus", "editor", "notes", 90.0, true);
+        assert_eq!(
+            row_line(&focus),
+            format!("{stamp}     1m  [focus] editor: notes (now)")
+        );
+        let file = row("file", "gedit", "a.txt", 10.0, false);
+        assert_eq!(row_line(&file), format!("{stamp}  [file] gedit: a.txt"));
+        let note = row("note", "", "left off here", 0.0, false);
+        assert_eq!(row_line(&note), format!("{stamp}  [note] left off here"));
+        let marker = row("marker", "", "away", 5.0, false);
+        assert_eq!(row_line(&marker), format!("{stamp}  [marker] away"));
+    }
+
+    #[test]
+    fn item_lines_fold_repeats_source_and_location() {
+        let stamp = timeutil::stamp(NOW);
+        let mut page = item("page");
+        page.content = "article".into();
+        page.creator = "Ada".into();
+        page.site = "example.com".into();
+        page.location = "https://example.com/rates".into();
+        page.seconds = 2580.0;
+        page.times = 2;
+        page.last_id = 42;
+        assert_eq!(
+            item_lines(&page),
+            format!(
+                "{stamp}  article Rates — Ada · example.com  (2×, 43m)\n                    https://example.com/rates  [id 42]"
+            )
+        );
+
+        let once = item("media");
+        assert_eq!(
+            item_lines(&once),
+            format!("{stamp}  media   Rates — chromium  (1m)")
+        );
+
+        let mut file = item("file");
+        file.title = "notes.md".into();
+        file.app.clear();
+        file.seconds = 0.0;
+        assert_eq!(item_lines(&file), format!("{stamp}  file    notes.md"));
+
+        let mut noted = item("note");
+        noted.times = 3;
+        noted.app.clear();
+        assert_eq!(item_lines(&noted), format!("{stamp}  note    Rates  (3×)"));
+    }
+
+    #[test]
+    fn forget_plan_covers_each_way_to_choose_rows() {
+        match plan_forget(NOW, Some("15m"), None, None, Some("signal".into()), true).unwrap() {
+            ForgetChoice::Ready(plan) => {
+                assert_eq!(plan.scope, "everything omaCortex has recorded");
+                assert!(plan.everything);
+                assert_eq!(plan.start, None);
+                assert_eq!(plan.end, None);
+                assert_eq!(plan.app, None);
+            }
+            ForgetChoice::MissingTarget => panic!("--all is a target"),
+        }
+
+        match plan_forget(NOW, Some("15m"), None, None, Some("signal".into()), false).unwrap() {
+            ForgetChoice::Ready(plan) => {
+                assert_eq!(plan.scope, "the last 15m");
+                assert_eq!(plan.start, Some(NOW - 900.0));
+                assert_eq!(plan.end, None);
+                assert_eq!(plan.app, None);
+                assert!(!plan.everything);
+            }
+            ForgetChoice::MissingTarget => panic!("--last is a target"),
+        }
+
+        match plan_forget(
+            NOW,
+            None,
+            Some("2h"),
+            Some("15m"),
+            Some("signal".into()),
+            false,
+        )
+        .unwrap()
+        {
+            ForgetChoice::Ready(plan) => {
+                assert_eq!(plan.scope, "matching activity");
+                assert_eq!(plan.start, Some(NOW - 7200.0));
+                assert_eq!(plan.end, Some(NOW - 900.0));
+                assert_eq!(plan.app.as_deref(), Some("signal"));
+                assert!(!plan.everything);
+            }
+            ForgetChoice::MissingTarget => panic!("filters are a target"),
+        }
+
+        match plan_forget(NOW, None, None, None, Some("signal".into()), false).unwrap() {
+            ForgetChoice::Ready(plan) => assert_eq!(plan.app.as_deref(), Some("signal")),
+            ForgetChoice::MissingTarget => panic!("--app is a target"),
+        }
+
+        assert!(matches!(
+            plan_forget(NOW, None, None, None, None, false).unwrap(),
+            ForgetChoice::MissingTarget
+        ));
+        assert!(plan_forget(NOW, Some("nope"), None, None, None, false).is_err());
+        assert!(plan_forget(NOW, None, Some("not-a-time"), None, None, false).is_err());
+    }
+
+    #[test]
+    fn browser_connection_line_names_each_state() {
+        assert_eq!(
+            browser_connection_line(false, false, "/bin/omacortex", 0),
+            "not connected (run `omacortex browser install`)"
+        );
+        assert_eq!(
+            browser_connection_line(true, false, "/opt/omacortex", 2),
+            "connected, but /opt/omacortex is missing; reinstall"
+        );
+        assert_eq!(
+            browser_connection_line(true, true, "/opt/omacortex", 2),
+            "connected for 2 extension(s)"
+        );
+    }
 
     fn readme_section<'a>(readme: &'a str, anchor: &str) -> &'a str {
         let marker = format!("id=\"{anchor}\"");
