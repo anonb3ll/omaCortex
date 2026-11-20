@@ -996,11 +996,39 @@ fn browser_command(action: BrowserCmd) -> Res<i32> {
     }
 }
 
+const ANCHOR_CONFIG: &str = "troubleshooting-config";
+const ANCHOR_PRIVACY: &str = "troubleshooting-privacy-patterns";
+const ANCHOR_HYPRLAND: &str = "troubleshooting-hyprland";
+const ANCHOR_BUSCTL: &str = "troubleshooting-busctl";
+const ANCHOR_BROWSER: &str = "troubleshooting-browser";
+const ANCHOR_MODEL: &str = "troubleshooting-no-local-model";
+const ANCHOR_CONSENT: &str = "troubleshooting-consent";
+const ANCHOR_DAEMON: &str = "troubleshooting-daemon";
+const ANCHOR_DATABASE: &str = "troubleshooting-database-permissions";
+
+const FAIL_HYPRLAND: &str = "no running Hyprland instance";
+const FAIL_BUSCTL: &str = "missing";
+const FAIL_BROWSER: &str = "optional: run `omacortex browser install`";
+const FAIL_CONSENT: &str = "run `omacortex enable`";
+const FAIL_DAEMON: &str = "not running";
+
+/// Failure details name the README anchor for that check. Passing checks stay as they are.
+fn doctor_detail(ok: bool, detail: impl Into<String>, anchor: &str) -> String {
+    let detail = detail.into();
+    if ok {
+        detail
+    } else {
+        format!("{detail} (README#{anchor})")
+    }
+}
+
 fn doctor(as_json: bool) -> Res<i32> {
     use std::os::unix::fs::PermissionsExt;
     let cfg = Config::load();
     let mut checks: Vec<(String, bool, String)> = Vec::new();
-    let mut add = |name: &str, ok: bool, detail: String| checks.push((name.into(), ok, detail));
+    let mut add = |name: &str, ok: bool, detail: String, anchor: &str| {
+        checks.push((name.into(), ok, doctor_detail(ok, detail, anchor)));
+    };
     add(
         "config",
         cfg.error.is_empty(),
@@ -1009,6 +1037,7 @@ fn doctor(as_json: bool) -> Res<i32> {
         } else {
             cfg.error.clone()
         },
+        ANCHOR_CONFIG,
     );
     let bad = privacy::Privacy::from_settings(&cfg.settings.privacy).bad_patterns;
     add(
@@ -1019,6 +1048,7 @@ fn doctor(as_json: bool) -> Res<i32> {
         } else {
             bad.join(", ")
         },
+        ANCHOR_PRIVACY,
     );
     let dir = collectors::hyprland::socket_dir();
     add(
@@ -1027,8 +1057,9 @@ fn doctor(as_json: bool) -> Res<i32> {
         if dir.is_some() {
             "found".into()
         } else {
-            "no running Hyprland instance".into()
+            FAIL_HYPRLAND.into()
         },
+        ANCHOR_HYPRLAND,
     );
     let busctl = collectors::media::available();
     add(
@@ -1040,8 +1071,9 @@ fn doctor(as_json: bool) -> Res<i32> {
                 collectors::media::list_players().len()
             )
         } else {
-            "missing".into()
+            FAIL_BUSCTL.into()
         },
+        ANCHOR_BUSCTL,
     );
     let connected: Vec<String> = browser::status(&browser::config_base())
         .into_iter()
@@ -1052,18 +1084,20 @@ fn doctor(as_json: bool) -> Res<i32> {
         "browser pages",
         !connected.is_empty(),
         if connected.is_empty() {
-            "optional: run `omacortex browser install`".into()
+            FAIL_BROWSER.into()
         } else {
             connected.join(", ")
         },
+        ANCHOR_BROWSER,
     );
     match llm::resolve(&cfg.settings.model) {
         Ok(m) => add(
             "local model",
             true,
             format!("{} at {}", m.model, m.endpoint),
+            ANCHOR_MODEL,
         ),
-        Err(e) => add("local model", false, format!("optional: {e}")),
+        Err(e) => add("local model", false, format!("optional: {e}"), ANCHOR_MODEL),
     }
     let c = Cortex::open(cfg, timeutil::system_clock())?;
     let s = c.status()?;
@@ -1073,8 +1107,9 @@ fn doctor(as_json: bool) -> Res<i32> {
         if s["consent"] == true {
             "enabled".into()
         } else {
-            "run `omacortex enable`".into()
+            FAIL_CONSENT.into()
         },
+        ANCHOR_CONSENT,
     );
     add(
         "daemon",
@@ -1082,14 +1117,16 @@ fn doctor(as_json: bool) -> Res<i32> {
         if s["daemon"] == true {
             "running".into()
         } else {
-            "not running".into()
+            FAIL_DAEMON.into()
         },
+        ANCHOR_DAEMON,
     );
     let mode = std::fs::metadata(c.cfg.paths.db())?.permissions().mode() & 0o777;
     add(
         "database permissions",
         mode == 0o600,
         format!("{} {mode:o}", c.cfg.paths.db().display()),
+        ANCHOR_DATABASE,
     );
     if as_json {
         print_json(
@@ -1143,4 +1180,74 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn readme_section<'a>(readme: &'a str, anchor: &str) -> &'a str {
+        let marker = format!("id=\"{anchor}\"");
+        let start = readme
+            .find(&marker)
+            .unwrap_or_else(|| panic!("README has no id=\"{anchor}\""));
+        let rest = &readme[start + marker.len()..];
+        let end = rest.find("<a id=\"").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn doctor_failure_strings_have_readme_anchors() {
+        let readme = include_str!("../README.md");
+        let static_failures = [
+            (FAIL_HYPRLAND, ANCHOR_HYPRLAND),
+            (FAIL_BUSCTL, ANCHOR_BUSCTL),
+            (FAIL_BROWSER, ANCHOR_BROWSER),
+            (FAIL_CONSENT, ANCHOR_CONSENT),
+            (FAIL_DAEMON, ANCHOR_DAEMON),
+        ];
+        for (detail, anchor) in static_failures {
+            let msg = doctor_detail(false, detail, anchor);
+            assert!(msg.ends_with(&format!("(README#{anchor})")), "{msg}");
+            assert!(
+                readme_section(readme, anchor).contains(detail),
+                "README#{anchor} does not quote {detail}"
+            );
+        }
+        let dynamic = [
+            ("config.toml: invalid type", ANCHOR_CONFIG, "does not parse"),
+            ("(?bad", ANCHOR_PRIVACY, "exclude_titles"),
+            (
+                "optional: no local model answered",
+                ANCHOR_MODEL,
+                "optional:",
+            ),
+            ("cortex.db 644", ANCHOR_DATABASE, "0600"),
+        ];
+        for (detail, anchor, documented) in dynamic {
+            let msg = doctor_detail(false, detail, anchor);
+            assert!(msg.contains(&format!("README#{anchor}")), "{msg}");
+            assert!(
+                readme_section(readme, anchor).contains(documented),
+                "README#{anchor} does not mention {documented}"
+            );
+        }
+        assert_eq!(doctor_detail(true, "found", ANCHOR_HYPRLAND), "found");
+        for anchor in [
+            ANCHOR_CONFIG,
+            ANCHOR_PRIVACY,
+            ANCHOR_HYPRLAND,
+            ANCHOR_BUSCTL,
+            ANCHOR_BROWSER,
+            ANCHOR_MODEL,
+            ANCHOR_CONSENT,
+            ANCHOR_DAEMON,
+            ANCHOR_DATABASE,
+        ] {
+            assert!(
+                readme.contains(&format!("id=\"{anchor}\"")),
+                "README is missing {anchor}"
+            );
+        }
+    }
 }
