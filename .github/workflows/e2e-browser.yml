@@ -2,9 +2,6 @@ name: e2e-browser
 
 on:
   pull_request:
-  push:
-    branches:
-      - release-prep/e2e-ci
 
 permissions:
   contents: read
