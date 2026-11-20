@@ -3,6 +3,13 @@
 All notable changes to omaCortex are recorded here. The notes below are taken
 from the GitHub releases. Dates are the release dates.
 
+## [0.3.2] - 2026-11-20
+
+- Forget a page read in the window, and stop older visits from growing
+  ([#4](https://github.com/anonb3ll/omaCortex/pull/4)).
+
+**Full changelog:** [v0.3.1...v0.3.2](https://github.com/anonb3ll/omaCortex/compare/v0.3.1...v0.3.2)
+
 ## [0.3.1] - 2026-11-20
 
 - Fix browser capture across pause, deletion, and delivery failures
@@ -24,6 +31,7 @@ from the GitHub releases. Dates are the release dates.
 
 **Full changelog:** [commits for v0.2.0](https://github.com/anonb3ll/omaCortex/commits/v0.2.0)
 
+[0.3.2]: https://github.com/anonb3ll/omaCortex/releases/tag/v0.3.2
 [0.3.1]: https://github.com/anonb3ll/omaCortex/releases/tag/v0.3.1
 [0.3.0]: https://github.com/anonb3ll/omaCortex/releases/tag/v0.3.0
 [0.2.0]: https://github.com/anonb3ll/omaCortex/releases/tag/v0.2.0
