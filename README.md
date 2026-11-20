@@ -59,9 +59,13 @@ omarchy plugin add https://github.com/anonb3ll/omaCortex --enable
 
 This adds the bar icon. The recorder itself is a small Rust binary, so the
 first time you open the panel it offers **Install recorder**, which runs
-`install.sh` in a terminal: it builds with `cargo` if you have Rust
-(`sudo pacman -S rust`), otherwise it downloads the release binary for your
-architecture and checks its sha256. Then press **Start recording**.
+`install.sh` in a terminal. If `cargo` is on `PATH` it builds. That build
+needs Rust 1.89 or newer and a C compiler (`cc`, `gcc`, or `clang`), because
+SQLite is compiled in, and it stops with install advice when either is
+missing. Otherwise it downloads the release binary for your architecture and
+checks its sha256. Examples: `sudo pacman -S rust base-devel`,
+`sudo apt install rustc cargo build-essential`,
+`sudo dnf install rust cargo gcc`. Then press **Start recording**.
 
 Or do both steps from a terminal:
 
@@ -235,10 +239,27 @@ stack and no D-Bus library. The database schema is the same one 0.1 wrote.
 
 ## Develop
 
+Building and the tests need Rust 1.89 or newer and a C compiler (`cc`, `gcc`,
+or `clang`). These are the same checks CI runs:
+
 ```bash
-cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo test
-node --test tests/model.test.js
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+node --test tests/model.test.js tests/extension.test.mjs
+```
+
+`tests/e2e-browser.mjs` loads the extension in a real Chromium and checks that
+a page shows up in `omacortex recall`. It is not part of CI. It needs
+`chromium` on `PATH` (or `CHROMIUM` set to the binary) and a built recorder:
+
+```bash
+cargo build && node tests/e2e-browser.mjs
+```
+
+These two commands are Omarchy-only:
+
+```bash
 omarchy plugin validate .
 omarchy agent look plugin .
 ```
