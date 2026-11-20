@@ -79,9 +79,14 @@ opens to a local program, and only the extension ids in that file may use it.
   `--app NAME`, or `--all`.
 - `omacortex forget --app youtube.com` deletes every page recorded from
   that site (a page's app is its host name).
-- After a forget, an unfinished browser visit that started before the
-  deletion cannot create a new history entry. A visit already stored and
-  outside the deletion filter can still be updated.
+- A time window removes a page you looked at during it, even if the tab
+  was opened earlier: each page keeps the time of its latest report as
+  well as how long it was in front.
+- After any forget, no browser visit that started before it is written
+  again: it cannot create a new entry or extend one that was kept. The
+  extension starts a fresh visit instead.
+- Forgetting an app or site that had entries also drops the cached day
+  summaries, which may quote it.
 - Retention runs hourly in two tiers. Window focus history, the bulk of
   what is recorded, is deleted after `privacy.retention_days` (default 30).
   What you watched, listened to, read, opened and noted is deleted after

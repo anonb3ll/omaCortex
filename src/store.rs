@@ -8,7 +8,10 @@
 //!
 //! A page visit reported by a browser is a span too. Its `meta` column holds
 //! the address, site, author and content type as JSON; the other kinds leave
-//! `meta` empty.
+//! `meta` empty. A page's `ended_at` is its start plus the seconds it was in
+//! front, which can be long before you last looked at it, so `meta.seen` also
+//! keeps the wall-clock time of its latest report. Forgetting a time window
+//! matches a page on whichever is later.
 
 use crate::timeutil::Clock;
 use rusqlite::types::Value as SqlValue;
@@ -293,7 +296,7 @@ impl Store {
     /// Record a page visit, or lengthen it if this visit was reported before.
     /// A browser reports a long visit several times with a growing duration;
     /// the visit is identified by its address and start time. Returns the row
-    /// id, or None if it would recreate activity from before a forget.
+    /// id, or None if the visit started before the latest forget.
     pub fn upsert_page(&self, v: &PageVisit) -> Res<Option<i64>> {
         let end = v.at + v.seconds.max(0.0);
         let detail: Vec<&str> = [v.site, v.author, v.url]
@@ -305,8 +308,20 @@ impl Store {
             "url": v.url, "site": v.site, "author": v.author, "content": v.content,
         })
         .to_string();
+        let now = self.now();
         let mut db = self.db();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A visit that started before a forget is never written again, new or
+        // not: a late report could otherwise carry reading from a forgotten
+        // window into a surviving row. The companion starts a fresh visit.
+        let forget_before: f64 = tx.query_row(
+            "SELECT COALESCE((SELECT CAST(value AS REAL) FROM meta WHERE key = 'page_forget_before'), 0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if v.at <= forget_before {
+            return Ok(None);
+        }
         let existing: Option<i64> = tx
             .query_row(
                 "SELECT id FROM activity WHERE kind = 'page' AND started_at BETWEEN ?1 AND ?2
@@ -318,24 +333,18 @@ impl Store {
         if let Some(id) = existing {
             tx.execute(
                 "UPDATE activity SET ended_at = MAX(COALESCE(ended_at, started_at), ?1),
-                 title = ?2, detail = ?3, meta = ?4 WHERE id = ?5",
-                params![end, v.title, detail, meta, id],
+                 title = ?2, detail = ?3,
+                 meta = json_set(?4, '$.seen', MAX(COALESCE(json_extract(meta, '$.seen'), 0), ?5))
+                 WHERE id = ?6",
+                params![end, v.title, detail, meta, now, id],
             )?;
             tx.commit()?;
             return Ok(Some(id));
         }
-        let forget_before: f64 = tx.query_row(
-            "SELECT COALESCE((SELECT CAST(value AS REAL) FROM meta WHERE key = 'page_forget_before'), 0)",
-            [],
-            |r| r.get(0),
-        )?;
-        if v.at <= forget_before {
-            return Ok(None);
-        }
         tx.execute(
             "INSERT INTO activity(kind, source, app, title, detail, started_at, ended_at, meta)
-             VALUES ('page', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![v.source, v.host, v.title, detail, v.at, end, meta],
+             VALUES ('page', ?1, ?2, ?3, ?4, ?5, ?6, json_set(?7, '$.seen', ?8))",
+            params![v.source, v.host, v.title, detail, v.at, end, meta, now],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
@@ -432,7 +441,12 @@ impl Store {
         let mut args: Vec<SqlValue> = Vec::new();
         if !everything {
             if let Some(s) = start {
-                clauses.push("COALESCE(ended_at, ?) >= ?".into());
+                // A page counts until its latest report, not just its start
+                // plus the time it was in front.
+                clauses.push(
+                    "MAX(COALESCE(ended_at, ?), CASE WHEN json_valid(meta) THEN COALESCE(json_extract(meta, '$.seen'), 0) ELSE 0 END) >= ?"
+                        .into(),
+                );
                 args.push(self.now().into());
                 args.push(s.into());
             }
@@ -455,14 +469,14 @@ impl Store {
                 params_from_iter(args),
             )
             .map_err(|e| e.to_string())?;
-        if everything || start.is_some() || end.is_some() {
+        if everything || start.is_some() || end.is_some() || count > 0 {
             // Cached summaries may quote forgotten activity.
             tx.execute("DELETE FROM summaries", [])
                 .map_err(|e| e.to_string())?;
         }
-        // Store only a timestamp. A late report may update a surviving row,
-        // but it cannot recreate a deleted row or insert an unfinished visit
-        // that started before this forget.
+        // Store only a timestamp. No page visit that started before this
+        // forget is written again: a late report cannot recreate a deleted
+        // row or lengthen a surviving one.
         tx.execute(
             "INSERT INTO meta (key, value) VALUES ('page_forget_before', ?1)
              ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS REAL), ?1)",
@@ -1057,6 +1071,98 @@ pub mod tests {
         assert!(s.forget(None, None, None, false).is_err());
         assert_eq!(s.forget(None, None, None, true).unwrap(), 1);
         assert!(s.timeline(&all()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_window_catches_a_page_read_in_it_long_after_it_opened() {
+        let c = TestClock::new();
+        let s = Store::memory(c.clock()).unwrap();
+        let url = "https://example.com/p/rates";
+        let opened = c.now();
+        c.tick(30.0);
+        s.upsert_page(&visit("Rates", url, opened, 30.0)).unwrap();
+        // The tab sits in the background for two hours, then is read again:
+        // its start plus its foreground seconds is still two hours ago.
+        c.tick(7200.0);
+        s.upsert_page(&visit("Rates, updated", url, opened, 60.0))
+            .unwrap();
+        s.put_summary("2027-01-15", "Read about rates", "m")
+            .unwrap();
+        let window = c.now() - 900.0;
+        assert_eq!(s.forget(Some(window), None, None, false).unwrap(), 1);
+        assert!(s.export().unwrap().is_empty());
+        assert!(s.get_summary("2027-01-15").is_none());
+        // The same visit's next report cannot bring it back.
+        c.tick(60.0);
+        assert_eq!(
+            s.upsert_page(&visit("Rates", url, opened, 120.0)).unwrap(),
+            None
+        );
+        assert!(s.export().unwrap().is_empty());
+        // A page last seen before the window is kept.
+        let earlier = c.now();
+        c.tick(60.0);
+        s.upsert_page(&visit("Earlier", url, earlier, 60.0))
+            .unwrap();
+        c.tick(3600.0);
+        assert_eq!(
+            s.forget(Some(c.now() - 900.0), None, None, false).unwrap(),
+            0
+        );
+        assert_eq!(s.export().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_forget_stops_every_earlier_visit_from_growing() {
+        let c = TestClock::new();
+        let s = Store::memory(c.clock()).unwrap();
+        let url = "https://example.com/p/rates";
+        let opened = c.now();
+        c.tick(60.0);
+        s.upsert_page(&visit("Rates", url, opened, 60.0)).unwrap();
+        s.put_summary("2027-01-15", "Read about rates", "m")
+            .unwrap();
+        // Forgetting another site leaves this row, and the summary, alone.
+        assert_eq!(s.forget(None, None, Some("other.example"), false), Ok(0));
+        assert!(s.get_summary("2027-01-15").is_some());
+        // A late report of the surviving visit could carry reading from a
+        // forgotten window into it, so it is refused rather than merged.
+        c.tick(60.0);
+        assert_eq!(
+            s.upsert_page(&visit("Rates, retitled", url, opened, 120.0))
+                .unwrap(),
+            None
+        );
+        let rows = s.export().unwrap();
+        assert_eq!(
+            (rows.len(), rows[0].title.as_str(), rows[0].seconds),
+            (1, "Rates", 60.0)
+        );
+        // The browser starts a fresh visit, which is stored.
+        let fresh = c.now();
+        c.tick(60.0);
+        assert!(
+            s.upsert_page(&visit("Rates", url, fresh, 60.0))
+                .unwrap()
+                .is_some()
+        );
+        // Forgetting a site that had rows drops summaries that may quote it.
+        assert_eq!(s.forget(None, None, Some("example.com"), false), Ok(2));
+        assert!(s.get_summary("2027-01-15").is_none());
+    }
+
+    #[test]
+    fn forgetting_a_window_tolerates_rows_with_unreadable_meta() {
+        let c = TestClock::new();
+        let s = Store::memory(c.clock()).unwrap();
+        s.db()
+            .execute(
+                "INSERT INTO activity(kind, source, app, title, started_at, ended_at, meta)
+                 VALUES ('focus', 'h', 'kitty', 'old', ?1, ?1, 'not json')",
+                [c.now() - 60.0],
+            )
+            .unwrap();
+        assert_eq!(s.forget(Some(c.now() - 900.0), None, None, false), Ok(1));
     }
 
     #[test]
