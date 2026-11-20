@@ -70,13 +70,26 @@ pub fn active_window(dir: &Path) -> Option<Window> {
 /// workspacev2>>ID,NAME             the active workspace changed
 /// activespecial>>NAME,MONITOR      a special workspace was shown or hidden
 /// closewindow>>ADDRESS             a window closed
+/// screencast>>STATE,OWNER          sharing started (1) or stopped (0)
 /// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventEffect {
+    /// Nothing the recorder needs to hear.
+    Ignore,
+    /// The focused window changed and capture is allowed.
+    Window,
+    /// Screen sharing started (`true`) or stopped (`false`).
+    Sharing(bool),
+}
+
 #[derive(Default)]
 pub struct EventParser {
     address: String,
     pub window: Option<Window>,
     workspace: String,
     special: String,
+    /// Hyprland reported an active screencast. Window capture stays paused.
+    pub sharing: bool,
 }
 
 impl EventParser {
@@ -87,10 +100,12 @@ impl EventParser {
         self.window = window;
     }
 
-    /// Returns true when the focused window changed.
-    pub fn feed(&mut self, line: &str) -> bool {
+    /// A window change is reported only while nothing is being shared.
+    /// The focused window is still tracked during a share, so capture can
+    /// resume on the same window when sharing stops.
+    pub fn feed(&mut self, line: &str) -> EventEffect {
         let Some((name, data)) = line.trim_end_matches('\n').split_once(">>") else {
-            return false;
+            return EventEffect::Ignore;
         };
         match name {
             "activewindow" => {
@@ -105,38 +120,64 @@ impl EventParser {
                 } else {
                     Some(Window::new(app, title, &ws))
                 };
-                true
+                self.visible(true)
             }
             "activewindowv2" => {
                 self.address = data.trim().to_string();
-                false
+                EventEffect::Ignore
             }
             "windowtitlev2" => {
                 let (addr, title) = data.split_once(',').unwrap_or((data, ""));
-                match &mut self.window {
+                let changed = match &mut self.window {
                     Some(w) if addr == self.address && w.title != title => {
                         w.title = title.to_string();
                         true
                     }
                     _ => false,
-                }
+                };
+                self.visible(changed)
             }
             "workspacev2" => {
                 self.workspace = data.split_once(',').map_or("", |(_, n)| n).to_string();
-                false
+                EventEffect::Ignore
             }
             "activespecial" => {
                 self.special = data.split_once(',').map_or(data, |(s, _)| s).to_string();
-                false
+                EventEffect::Ignore
             }
             "closewindow" => {
                 if data.trim() == self.address {
                     self.address.clear();
                 }
-                false
+                EventEffect::Ignore
             }
-            _ => false,
+            "screencast" => self.screencast(data),
+            _ => EventEffect::Ignore,
         }
+    }
+
+    fn visible(&self, changed: bool) -> EventEffect {
+        if changed && !self.sharing {
+            EventEffect::Window
+        } else {
+            EventEffect::Ignore
+        }
+    }
+
+    /// `screencast>>1,...` starts a share. `screencast>>0` (with or without
+    /// a trailing owner) stops it. Anything else is ignored.
+    fn screencast(&mut self, data: &str) -> EventEffect {
+        let state = data.split(',').next().unwrap_or(data).trim();
+        let sharing = match state {
+            "1" => true,
+            "0" => false,
+            _ => return EventEffect::Ignore,
+        };
+        if sharing == self.sharing {
+            return EventEffect::Ignore;
+        }
+        self.sharing = sharing;
+        EventEffect::Sharing(sharing)
     }
 }
 
@@ -176,8 +217,21 @@ fn stream(
                 ));
             }
             Ok(_) if line.ends_with(b"\n") => {
-                if parser.feed(&String::from_utf8_lossy(&line)) {
-                    on_window(parser.window.clone());
+                match parser.feed(&String::from_utf8_lossy(&line)) {
+                    EventEffect::Window => on_window(parser.window.clone()),
+                    EventEffect::Sharing(true) => {
+                        eprintln!(
+                            "omacortex: hyprland: screen sharing started; window capture paused"
+                        );
+                        on_window(None);
+                    }
+                    EventEffect::Sharing(false) => {
+                        eprintln!(
+                            "omacortex: hyprland: screen sharing stopped; window capture resumed"
+                        );
+                        on_window(parser.window.clone());
+                    }
+                    EventEffect::Ignore => {}
                 }
                 line.clear();
             }
@@ -200,21 +254,55 @@ mod tests {
     fn parser_tracks_focus_and_titles() {
         let mut p = EventParser::default();
         p.seed(Some(Window::new("kitty", "shell", "1")));
-        assert!(!p.feed("workspacev2>>2,2"));
+        assert_eq!(p.feed("workspacev2>>2,2"), EventEffect::Ignore);
         p.feed("activewindowv2>>0xabc");
-        assert!(p.feed("activewindow>>chromium,Issue 12, comments - GitHub"));
+        assert_eq!(
+            p.feed("activewindow>>chromium,Issue 12, comments - GitHub"),
+            EventEffect::Window
+        );
         assert_eq!(
             p.window,
             Some(Window::new("chromium", "Issue 12, comments - GitHub", "2"))
         );
-        assert!(p.feed("windowtitlev2>>0xabc,Pull 13 - GitHub"));
+        assert_eq!(
+            p.feed("windowtitlev2>>0xabc,Pull 13 - GitHub"),
+            EventEffect::Window
+        );
         assert_eq!(p.window.as_ref().unwrap().title, "Pull 13 - GitHub");
-        assert!(!p.feed("windowtitlev2>>0xdef,Other"));
+        assert_eq!(p.feed("windowtitlev2>>0xdef,Other"), EventEffect::Ignore);
         p.feed("activespecial>>special:scratch,DP-1");
         p.feed("activewindow>>kitty,scratch");
         assert_eq!(p.window.as_ref().unwrap().workspace, "special:scratch");
-        assert!(p.feed("activewindow>>,"));
+        assert_eq!(p.feed("activewindow>>,"), EventEffect::Window);
         assert_eq!(p.window, None);
-        assert!(!p.feed("garbage without separator"));
+        assert_eq!(p.feed("garbage without separator"), EventEffect::Ignore);
+    }
+
+    #[test]
+    fn screencast_pauses_capture_and_remembers_the_window() {
+        let mut p = EventParser::default();
+        p.seed(Some(Window::new("kitty", "shell", "1")));
+        assert!(!p.sharing);
+
+        assert_eq!(p.feed("screencast>>1,0"), EventEffect::Sharing(true));
+        assert!(p.sharing);
+        // A second start, and a non-0/1 state, do not flap the pause.
+        assert_eq!(p.feed("screencast>>1,1"), EventEffect::Ignore);
+        assert_eq!(p.feed("screencast>>2,0"), EventEffect::Ignore);
+        assert!(p.sharing);
+
+        // Focus still updates, but nothing is emitted while sharing.
+        assert_eq!(p.feed("activewindowv2>>0xabc"), EventEffect::Ignore);
+        assert_eq!(p.feed("windowtitlev2>>0xabc,notes"), EventEffect::Ignore);
+        assert_eq!(p.window.as_ref().unwrap().title, "notes");
+        assert_eq!(p.feed("activewindow>>editor,buffer"), EventEffect::Ignore);
+        assert_eq!(p.window, Some(Window::new("editor", "buffer", "1")));
+
+        assert_eq!(p.feed("screencast>>0"), EventEffect::Sharing(false));
+        assert!(!p.sharing);
+        assert_eq!(p.window, Some(Window::new("editor", "buffer", "1")));
+        // Already stopped: `>>0,...` is not another transition.
+        assert_eq!(p.feed("screencast>>0,1"), EventEffect::Ignore);
+        assert_eq!(p.feed("activewindow>>kitty,shell"), EventEffect::Window);
     }
 }
