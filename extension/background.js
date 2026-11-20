@@ -8,17 +8,15 @@ import * as Visit from "./visit.js"
 
 const HOST = "io.github.anonb3ll.omacortex"
 const ALARM = "omacortex-tick"
+const REPORT_TTL_MS = 120000
+const MAX_PENDING_REPORTS = 16
+const RETRY_DELAY_MS = 5000
 
 // Events arrive in bursts (a tab switch fires several); handle them one at a time.
 let queue = Promise.resolve()
 function serial(work) {
   queue = queue.then(work).catch(() => {})
   return queue
-}
-
-async function loadState() {
-  const stored = await chrome.storage.session.get("state")
-  return stored.state || Visit.emptyState()
 }
 
 async function isEnabled() {
@@ -52,26 +50,48 @@ async function pageMeta(tabId) {
   }
 }
 
-async function deliver(messages) {
-  for (const message of messages) {
-    let result
+function sameVisit(left, right) {
+  return !!right && left.url === right.url && left.at === right.at
+}
+
+async function deliver(state, pending) {
+  while (pending.length) {
+    const { message } = pending[0]
+    let reply = null
+    let error
     try {
-      const reply = await chrome.runtime.sendNativeMessage(HOST, Object.assign({ v: 1, type: "page", source: "companion" }, message))
-      result = { ok: !!(reply && reply.ok), reply: reply || null, at: Date.now() }
+      reply = await chrome.runtime.sendNativeMessage(HOST, { v: 1, type: "page", source: "companion", ...message })
     } catch (e) {
-      result = { ok: false, error: String((e && e.message) || e), at: Date.now() }
+      error = String((e && e.message) || e)
     }
-    await chrome.storage.session.set({ host: result })
+    const at = Date.now()
+    const host = { ok: !!reply?.ok, reply, error: error || "", at }
+    if (!reply || reply.retryable === true) {
+      await chrome.storage.session.set({ host, retryAt: at + RETRY_DELAY_MS })
+      return
+    }
+    pending.shift()
+    if (reply.recording === false) {
+      state = Visit.emptyState()
+      pending.length = 0
+    } else if (reply.reason === "before recording resumed" || reply.reason === "visit forgotten") {
+      const stale = visit => sameVisit(message, visit) ||
+        (reply.reason === "before recording resumed" && visit?.at < reply.recording_since)
+      if (stale(state.visit)) state = Visit.emptyState()
+      pending = pending.filter(item => !stale(item.message))
+    }
+    await chrome.storage.session.set({ state, pending, host, retryAt: 0 })
   }
 }
 
 async function update(step) {
   const now = Date.now()
   if (!(await isEnabled())) {
-    await chrome.storage.session.set({ state: Visit.emptyState() })
+    await chrome.storage.session.set({ state: Visit.emptyState(), pending: [], retryAt: 0 })
     return
   }
-  let state = await loadState()
+  const stored = await chrome.storage.session.get(["state", "pending", "retryAt"])
+  let state = stored.state || Visit.emptyState()
   let send = []
   if (step === "tick") {
     // Ask again what the page says about itself: a page that was still
@@ -92,8 +112,15 @@ async function update(step) {
       state = Visit.setMeta(state, page.tabId, await pageMeta(page.tabId))
     }
   }
-  await chrome.storage.session.set({ state: state })
-  await deliver(send)
+  let pending = (stored.pending || []).filter(item => now - item.queuedAt < REPORT_TTL_MS)
+  for (const message of send) {
+    const retry = pending.find(item => sameVisit(message, item.message))
+    if (retry) retry.message = message
+    else pending.push({ message, queuedAt: now })
+  }
+  pending = pending.slice(-MAX_PENDING_REPORTS)
+  await chrome.storage.session.set({ state, pending })
+  if (now >= (stored.retryAt || 0)) await deliver(state, pending)
 }
 
 function refresh() {

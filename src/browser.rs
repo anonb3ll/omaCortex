@@ -22,6 +22,7 @@
 //!   `{"ok":true,"stored":true|false,"reason":…,"recording":…,"version":"…"}`.
 //!   `seconds` is foreground time so far and `at` the start of the visit in
 //!   epoch seconds; sending the same `url` and `at` again lengthens that visit.
+//!   A temporary storage failure returns `retryable: true`.
 //! - Anything else replies `{"ok":false,"error":"…"}`.
 
 use crate::api::Cortex;
@@ -111,7 +112,8 @@ pub fn handle(cortex: &Cortex, recorder: &Recorder, msg: &Value) -> Value {
                     json!({"ok": true, "stored": true, "recording": recording, "version": version})
                 }
                 PageOutcome::Skipped(reason) => {
-                    json!({"ok": true, "stored": false, "reason": reason, "recording": recording, "version": version})
+                    json!({"ok": true, "stored": false, "reason": reason, "retryable": reason == "store error",
+                        "recording": recording, "recording_since": state.recording_since, "version": version})
                 }
             }
         }
@@ -364,6 +366,69 @@ mod tests {
         json!({"v": 1, "type": "page", "source": "companion", "url": "https://writer.substack.com/p/small-models?utm_source=x",
                "title": "Why small models win", "site": "The Writer", "author": "A. Writer", "content": "article",
                "seconds": seconds, "at": at})
+    }
+
+    fn report(cortex: &Cortex, visit: Value) -> Value {
+        let mut out = Vec::new();
+        serve(cortex, framed(&[visit]).as_slice(), &mut out).unwrap();
+        replies(&out).pop().unwrap()
+    }
+
+    #[test]
+    fn page_visits_cannot_cross_consent_or_resume() {
+        let (cortex, clock) = cortex(Settings::default(), false);
+        let before_consent = clock.now();
+        clock.tick(60.0);
+        cortex.state.grant().unwrap();
+        assert_eq!(report(&cortex, page(60.0, before_consent))["stored"], false);
+
+        let before_pause = clock.now();
+        clock.tick(60.0);
+        cortex.state.pause(None).unwrap();
+        let while_paused = clock.now();
+        clock.tick(60.0);
+        assert_eq!(
+            report(&cortex, page(60.0, while_paused))["reason"],
+            "paused"
+        );
+        cortex.state.resume().unwrap();
+        assert_eq!(
+            report(&cortex, page(60.0, while_paused))["reason"],
+            "before recording resumed"
+        );
+        assert_eq!(report(&cortex, page(180.0, before_pause))["stored"], false);
+
+        cortex.state.pause(Some(60.0)).unwrap();
+        let timed_pause = clock.now();
+        clock.tick(61.0);
+        let after_resume = clock.now();
+        clock.tick(60.0);
+        assert_eq!(report(&cortex, page(120.0, timed_pause))["stored"], false);
+        assert_eq!(report(&cortex, page(60.0, after_resume))["stored"], true);
+        assert_eq!(cortex.store.export().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_late_page_report_cannot_recreate_a_forgotten_visit() {
+        let (cortex, clock) = cortex(Settings::default(), true);
+        let started = clock.now();
+        clock.tick(60.0);
+        assert_eq!(report(&cortex, page(60.0, started))["stored"], true);
+        assert_eq!(
+            cortex
+                .store
+                .forget(None, None, Some("writer.substack.com"), false),
+            Ok(1)
+        );
+        let cortex = Cortex::open(cortex.cfg.clone(), clock.clock()).unwrap();
+        clock.tick(15.0);
+        let stale = report(&cortex, page(75.0, started));
+        assert_eq!(stale["reason"], "visit forgotten");
+        assert_eq!(stale["retryable"], false);
+        assert!(cortex.store.export().unwrap().is_empty());
+        let fresh = clock.now();
+        clock.tick(60.0);
+        assert_eq!(report(&cortex, page(60.0, fresh))["stored"], true);
     }
 
     #[test]

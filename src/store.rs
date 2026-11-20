@@ -12,7 +12,7 @@
 
 use crate::timeutil::Clock;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -293,8 +293,8 @@ impl Store {
     /// Record a page visit, or lengthen it if this visit was reported before.
     /// A browser reports a long visit several times with a growing duration;
     /// the visit is identified by its address and start time. Returns the row
-    /// id and whether the row is new.
-    pub fn upsert_page(&self, v: &PageVisit) -> Res<(i64, bool)> {
+    /// id, or None if it would recreate activity from before a forget.
+    pub fn upsert_page(&self, v: &PageVisit) -> Res<Option<i64>> {
         let end = v.at + v.seconds.max(0.0);
         let detail: Vec<&str> = [v.site, v.author, v.url]
             .into_iter()
@@ -305,8 +305,9 @@ impl Store {
             "url": v.url, "site": v.site, "author": v.author, "content": v.content,
         })
         .to_string();
-        let db = self.db();
-        let existing: Option<i64> = db
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<i64> = tx
             .query_row(
                 "SELECT id FROM activity WHERE kind = 'page' AND started_at BETWEEN ?1 AND ?2
                  AND json_extract(meta, '$.url') = ?3 ORDER BY id LIMIT 1",
@@ -315,19 +316,30 @@ impl Store {
             )
             .optional()?;
         if let Some(id) = existing {
-            db.execute(
+            tx.execute(
                 "UPDATE activity SET ended_at = MAX(COALESCE(ended_at, started_at), ?1),
                  title = ?2, detail = ?3, meta = ?4 WHERE id = ?5",
                 params![end, v.title, detail, meta, id],
             )?;
-            return Ok((id, false));
+            tx.commit()?;
+            return Ok(Some(id));
         }
-        db.execute(
+        let forget_before: f64 = tx.query_row(
+            "SELECT COALESCE((SELECT CAST(value AS REAL) FROM meta WHERE key = 'page_forget_before'), 0)",
+            [],
+            |r| r.get(0),
+        )?;
+        if v.at <= forget_before {
+            return Ok(None);
+        }
+        tx.execute(
             "INSERT INTO activity(kind, source, app, title, detail, started_at, ended_at, meta)
              VALUES ('page', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![v.source, v.host, v.title, detail, v.at, end, meta],
         )?;
-        Ok((db.last_insert_rowid(), true))
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(id))
     }
 
     pub fn open_span(
@@ -433,8 +445,11 @@ impl Store {
                 args.push(a.to_string().into());
             }
         }
-        let db = self.db();
-        let count = db
+        let mut db = self.db();
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let count = tx
             .execute(
                 &format!("DELETE FROM activity WHERE {}", clauses.join(" AND ")),
                 params_from_iter(args),
@@ -442,9 +457,19 @@ impl Store {
             .map_err(|e| e.to_string())?;
         if everything || start.is_some() || end.is_some() {
             // Cached summaries may quote forgotten activity.
-            db.execute("DELETE FROM summaries", [])
+            tx.execute("DELETE FROM summaries", [])
                 .map_err(|e| e.to_string())?;
         }
+        // Store only a timestamp. A late report may update a surviving row,
+        // but it cannot recreate a deleted row or insert an unfinished visit
+        // that started before this forget.
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('page_forget_before', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS REAL), ?1)",
+            [self.now()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         if everything {
             db.execute_batch("INSERT INTO activity_fts(activity_fts) VALUES ('rebuild'); VACUUM;")
                 .map_err(|e| e.to_string())?;
@@ -900,7 +925,8 @@ pub mod tests {
         let again = s
             .upsert_page(&visit("Interest rates explained", url, t0, 300.0))
             .unwrap();
-        assert_eq!((first.1, again), (true, (first.0, false)));
+        assert!(first.is_some());
+        assert_eq!(first, again);
         s.upsert_page(&visit("Interest rates explained", url, t0 + 3600.0, 100.0))
             .unwrap();
         s.add_event(
