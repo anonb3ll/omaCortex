@@ -432,6 +432,31 @@ mod tests {
     }
 
     #[test]
+    fn a_forget_ends_a_surviving_visit_and_the_next_one_records() {
+        let (cortex, clock) = cortex(Settings::default(), true);
+        let started = clock.now();
+        clock.tick(60.0);
+        assert_eq!(report(&cortex, page(60.0, started))["stored"], true);
+        clock.tick(7200.0);
+        // Nothing in the last 15 minutes was this page's foreground time, but
+        // it was reported then, so a 15-minute forget removes it.
+        let window = clock.now() - 900.0;
+        report(&cortex, page(90.0, started));
+        assert_eq!(cortex.store.forget(Some(window), None, None, false), Ok(1));
+        let stale = report(&cortex, page(120.0, started));
+        assert_eq!(
+            (&stale["reason"], &stale["retryable"]),
+            (&json!("visit forgotten"), &json!(false))
+        );
+        assert!(cortex.store.export().unwrap().is_empty());
+        // The companion starts over once the reply arrives, after the forget.
+        clock.tick(1.0);
+        let fresh = clock.now();
+        clock.tick(60.0);
+        assert_eq!(report(&cortex, page(60.0, fresh))["stored"], true);
+    }
+
+    #[test]
     fn a_page_is_stored_once_and_lengthened() {
         let (cortex, c) = cortex(Settings::default(), true);
         let t0 = c.now();
