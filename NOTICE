@@ -1,0 +1,25 @@
+Third-party notices for omaCortex.
+
+The project license is MIT. These notes cover components that are compiled
+with it. Crate versions are the ones in Cargo.lock.
+
+SQLite
+  The Linux build compiles the SQLite amalgamation shipped in libsqlite3-sys
+  (rusqlite's "bundled" feature) and links it into the binary. SQLite is in
+  the public domain. Its author disclaims copyright.
+
+foldhash
+  foldhash is linked into the binary. It is under the zlib license.
+  The copyright notice in that crate must stay with any source distribution
+  of foldhash. An acknowledgment in documentation that accompanies a binary
+  is appreciated and is not required.
+
+unicode-ident
+  unicode-ident is used while compiling, through proc-macro2. It is not part
+  of the release binary. Its license is (MIT OR Apache-2.0) AND Unicode-3.0.
+  Unicode-3.0 applies when that crate's source is distributed: the Unicode
+  copyright and permission notice must appear with those copies, or in the
+  documentation that accompanies them.
+
+Other locked crates are MIT, MIT OR Apache-2.0, or Unlicense OR MIT. Where
+there is a choice, the MIT terms are the ones that apply to this distribution.
