@@ -88,15 +88,18 @@ pub struct EventParser {
     pub window: Option<Window>,
     workspace: String,
     special: String,
-    /// Hyprland reported an active screencast. Window capture stays paused.
-    pub sharing: bool,
+    /// Number of observed shares that have not sent a stop event.
+    active_shares: usize,
 }
 
 impl EventParser {
     pub fn seed(&mut self, window: Option<Window>) {
-        if let Some(w) = &window {
-            self.workspace = w.workspace.clone();
-        }
+        self.address.clear();
+        self.special.clear();
+        self.workspace = window
+            .as_ref()
+            .map(|w| w.workspace.clone())
+            .unwrap_or_default();
         self.window = window;
     }
 
@@ -157,39 +160,53 @@ impl EventParser {
     }
 
     fn visible(&self, changed: bool) -> EventEffect {
-        if changed && !self.sharing {
+        if changed && !self.is_sharing() {
             EventEffect::Window
         } else {
             EventEffect::Ignore
         }
     }
 
+    fn is_sharing(&self) -> bool {
+        self.active_shares > 0
+    }
+
     /// `screencast>>1,...` starts a share. `screencast>>0` (with or without
     /// a trailing owner) stops it. Anything else is ignored.
     fn screencast(&mut self, data: &str) -> EventEffect {
         let state = data.split(',').next().unwrap_or(data).trim();
-        let sharing = match state {
-            "1" => true,
-            "0" => false,
+        let was_sharing = self.is_sharing();
+        match state {
+            "1" => self.active_shares = self.active_shares.saturating_add(1),
+            "0" => self.active_shares = self.active_shares.saturating_sub(1),
             _ => return EventEffect::Ignore,
-        };
-        if sharing == self.sharing {
+        }
+        let sharing = self.is_sharing();
+        if sharing == was_sharing {
             return EventEffect::Ignore;
         }
-        self.sharing = sharing;
         EventEffect::Sharing(sharing)
     }
 }
 
 pub fn run(on_window: impl Fn(Option<Window>), stop: &AtomicBool) {
     let mut backoff = 1.0_f64;
+    let mut instance = None;
+    let mut parser = EventParser::default();
     while !stop.load(Ordering::Relaxed) {
         match socket_dir() {
             None => eprintln!("omacortex: hyprland: no running instance found; retrying"),
-            Some(dir) => match stream(&dir, &on_window, stop) {
-                Ok(()) => backoff = 1.0,
-                Err(e) => eprintln!("omacortex: hyprland: event socket: {e}"),
-            },
+            Some(dir) => {
+                if instance.as_ref() != Some(&dir) {
+                    parser = EventParser::default();
+                    instance = Some(dir.clone());
+                }
+                // A socket disconnect does not end a share in this instance.
+                match stream(&dir, &mut parser, &on_window, stop) {
+                    Ok(()) => backoff = 1.0,
+                    Err(e) => eprintln!("omacortex: hyprland: event socket: {e}"),
+                }
+            }
         }
         wait(stop, backoff);
         backoff = (backoff * 2.0).min(30.0);
@@ -198,14 +215,16 @@ pub fn run(on_window: impl Fn(Option<Window>), stop: &AtomicBool) {
 
 fn stream(
     dir: &Path,
+    parser: &mut EventParser,
     on_window: &impl Fn(Option<Window>),
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
-    let mut parser = EventParser::default();
-    parser.seed(active_window(dir));
-    on_window(parser.window.clone());
     let sock = UnixStream::connect(dir.join(".socket2.sock"))?;
     sock.set_read_timeout(Some(Duration::from_secs(1)))?;
+    parser.seed(active_window(dir));
+    if !parser.is_sharing() {
+        on_window(parser.window.clone());
+    }
     let mut reader = BufReader::new(sock);
     let mut line = Vec::new();
     while !stop.load(Ordering::Relaxed) {
@@ -229,6 +248,7 @@ fn stream(
                         eprintln!(
                             "omacortex: hyprland: screen sharing stopped; window capture resumed"
                         );
+                        parser.seed(active_window(dir));
                         on_window(parser.window.clone());
                     }
                     EventEffect::Ignore => {}
@@ -282,14 +302,15 @@ mod tests {
     fn screencast_pauses_capture_and_remembers_the_window() {
         let mut p = EventParser::default();
         p.seed(Some(Window::new("kitty", "shell", "1")));
-        assert!(!p.sharing);
+        assert!(!p.is_sharing());
 
         assert_eq!(p.feed("screencast>>1,0"), EventEffect::Sharing(true));
-        assert!(p.sharing);
-        // A second start, and a non-0/1 state, do not flap the pause.
+        assert!(p.is_sharing());
+        // A second client keeps capture paused after the first one stops.
         assert_eq!(p.feed("screencast>>1,1"), EventEffect::Ignore);
         assert_eq!(p.feed("screencast>>2,0"), EventEffect::Ignore);
-        assert!(p.sharing);
+        assert_eq!(p.feed("screencast>>0,1"), EventEffect::Ignore);
+        assert!(p.is_sharing());
 
         // Focus still updates, but nothing is emitted while sharing.
         assert_eq!(p.feed("activewindowv2>>0xabc"), EventEffect::Ignore);
@@ -299,10 +320,55 @@ mod tests {
         assert_eq!(p.window, Some(Window::new("editor", "buffer", "1")));
 
         assert_eq!(p.feed("screencast>>0"), EventEffect::Sharing(false));
-        assert!(!p.sharing);
+        assert!(!p.is_sharing());
         assert_eq!(p.window, Some(Window::new("editor", "buffer", "1")));
         // Already stopped: `>>0,...` is not another transition.
         assert_eq!(p.feed("screencast>>0,1"), EventEffect::Ignore);
         assert_eq!(p.feed("activewindow>>kitty,shell"), EventEffect::Window);
+    }
+
+    #[test]
+    fn reconnect_keeps_capture_paused_until_share_stops() {
+        use std::cell::RefCell;
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("oc-hypr-reconnect-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let events = UnixListener::bind(dir.join(".socket2.sock")).unwrap();
+        let requests = UnixListener::bind(dir.join(".socket.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let snapshot = |title| {
+                let (mut request, _) = requests.accept().unwrap();
+                let mut command = [0; b"j/activewindow".len()];
+                request.read_exact(&mut command).unwrap();
+                assert_eq!(&command, b"j/activewindow");
+                write!(request, r#"{{"class":"editor","title":"{title}"}}"#).unwrap();
+            };
+            let (mut first, _) = events.accept().unwrap();
+            snapshot("initial");
+            first.write_all(b"screencast>>1,0\n").unwrap();
+            drop(first);
+            let (mut second, _) = events.accept().unwrap();
+            snapshot("during share");
+            second
+                .write_all(b"activewindow>>editor,also during share\nscreencast>>0,0\n")
+                .unwrap();
+            drop(second);
+            snapshot("resumed");
+        });
+        let seen = RefCell::new(Vec::new());
+        let emit = |window: Option<Window>| seen.borrow_mut().push(window.map(|w| w.title));
+        let stop = AtomicBool::new(false);
+        let mut parser = EventParser::default();
+        for _ in 0..2 {
+            let err = stream(&dir, &mut parser, &emit, &stop).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            seen.into_inner(),
+            [Some("initial".into()), None, Some("resumed".into())]
+        );
+        server.join().unwrap();
     }
 }
