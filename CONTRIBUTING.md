@@ -28,6 +28,10 @@ node --test tests/model.test.js tests/extension.test.mjs
 Continuous integration runs those commands on every pull request. `cargo fmt`
 and clippy are required: warnings are denied.
 
+The secret-scan job checks commits introduced by the pull request and hides
+scanner output. To check a branch locally, run
+`bash scripts/secret-scan.sh git HEAD origin/main`.
+
 `install.sh --build` compiles the release binary. `install.sh --download`
 fetches the GitHub release that matches `version` in `Cargo.toml` and checks
 its sha256. Use `--download` when you want to try the published binary rather
