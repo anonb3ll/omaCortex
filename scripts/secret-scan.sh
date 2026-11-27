@@ -34,6 +34,13 @@ case "$mode" in
     ;;
 esac
 
+# Gitleaks also loads the source's ignore file even with an explicit
+# --gitleaks-ignore-path. Refuse it so a PR cannot suppress findings.
+if [[ -e "$source/.gitleaksignore" || -L "$source/.gitleaksignore" ]]; then
+  echo "Secret scan refuses a source .gitleaksignore." >&2
+  exit 2
+fi
+
 version=8.30.1
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64)
@@ -72,8 +79,8 @@ curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --loca
 printf '%s  %s\n' "$sha256" "$scratch/$archive" | "${checksum[@]}" -c >/dev/null
 tar -xzf "$scratch/$archive" -C "$scratch" gitleaks
 
-# A change under review cannot disable built-in rules with repo config,
-# .gitleaksignore or inline allow comments. CI never prints scanner output.
+# Use built-in rules instead of repo config or inline allow comments.
+# CI never prints scanner output.
 printf '[extend]\nuseDefault = true\n' > "$scratch/config.toml"
 touch "$scratch/ignore"
 scan() {
