@@ -6,6 +6,10 @@
 #
 # `commits` inspects base..head only. The base commit itself is not inspected.
 # GitHub noreply addresses, the web-flow account, and bot accounts are allowed.
+# The operator's own identity is additionally allowed in COMMIT METADATA
+# (Anthony, 2026-11-27): GitHub authors a merge commit with it, and a landing
+# that goes through a pull request must not be refused for that. In tracked
+# FILES it stays a finding - `files` mode is unchanged.
 # Findings name the commit SHA or file and the kind of match. They never
 # include the matched address.
 set -euo pipefail
@@ -34,6 +38,18 @@ handle_re() {
 mail_re() {
   # Escaped dot so this is a pattern, not a literal address.
   printf '@%s\\.%s' "$(printf '%s%s' gm ail)" "$(printf '%s%s' c om)"
+}
+
+# The operator's own address, assembled from the same pieces so this file never
+# contains it: `files` mode scans this script too.
+operator_mail() {
+  printf '%s@%s.%s' "$(handle_re)" "$(printf '%s%s' gm ail)" "$(printf '%s%s' c om)"
+}
+
+is_operator_identity() {
+  local value=$1 lower
+  lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  [ "$lower" = "$(operator_mail)" ]
 }
 
 is_allowed() {
@@ -150,6 +166,7 @@ check_commits() {
     cemail=$(git -C "$repo" log -1 --format='%ce' "$sha")
     body=$(git -C "$repo" log -1 --format='%b' "$sha")
     for value in "$name" "$email" "$cname" "$cemail"; do
+      is_operator_identity "$value" && continue
       if kind=$(classify "$value"); then
         printf 'identity-gate: %s %s\n' "$sha" "$kind"
         hits=1
