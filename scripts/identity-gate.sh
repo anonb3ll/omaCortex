@@ -6,6 +6,10 @@
 #
 # `commits` inspects base..head only. The base commit itself is not inspected.
 # GitHub noreply addresses, the web-flow account, and bot accounts are allowed.
+# The operator's own identity is additionally allowed in COMMIT METADATA
+# (Anthony, 2026-11-27): GitHub authors a merge commit with it, and a landing
+# that goes through a pull request must not be refused for that. In tracked
+# FILES it stays a finding - `files` mode is unchanged.
 # Findings name the commit SHA or file and the kind of match. They never
 # include the matched address.
 set -euo pipefail
@@ -34,6 +38,18 @@ handle_re() {
 mail_re() {
   # Escaped dot so this is a pattern, not a literal address.
   printf '@%s\\.%s' "$(printf '%s%s' gm ail)" "$(printf '%s%s' c om)"
+}
+
+# The operator's own address, assembled from the same pieces so this file never
+# contains it: `files` mode scans this script too.
+operator_mail() {
+  printf '%s@%s.%s' "$(handle_re)" "$(printf '%s%s' gm ail)" "$(printf '%s%s' c om)"
+}
+
+is_operator_identity() {
+  local value=$1 lower
+  lower=$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')
+  [ "$lower" = "$(operator_mail)" ]
 }
 
 is_allowed() {
@@ -131,6 +147,23 @@ trailer_values() {
   printf '%s\n' "$body" | grep -i '^Co-authored-by:' || true
 }
 
+# One commit-metadata value: 0 when it is a finding, so the caller can count it.
+# The operator's own address is acceptable in the author and committer EMAIL
+# fields only (Anthony, 2026-11-27). Name fields keep the full rules, and
+# `files` mode never consults this at all.
+check_value() {
+  local sha=$1 kind=$2 value=$3 found
+  [ -n "$value" ] || return 0
+  if [ "$kind" = email ] && is_operator_identity "$value"; then
+    return 0
+  fi
+  if found=$(classify "$value"); then
+    printf 'identity-gate: %s %s\n' "$sha" "$found"
+    return 1
+  fi
+  return 0
+}
+
 check_commits() {
   local base=$1 head=$2 repo=$3
   local hits=0 sha name email cname cemail body value kind
@@ -149,12 +182,10 @@ check_commits() {
     cname=$(git -C "$repo" log -1 --format='%cn' "$sha")
     cemail=$(git -C "$repo" log -1 --format='%ce' "$sha")
     body=$(git -C "$repo" log -1 --format='%b' "$sha")
-    for value in "$name" "$email" "$cname" "$cemail"; do
-      if kind=$(classify "$value"); then
-        printf 'identity-gate: %s %s\n' "$sha" "$kind"
-        hits=1
-      fi
-    done
+    check_value "$sha" name "$name" || hits=1
+    check_value "$sha" email "$email" || hits=1
+    check_value "$sha" name "$cname" || hits=1
+    check_value "$sha" email "$cemail" || hits=1
     while IFS= read -r value; do
       [ -n "$value" ] || continue
       if kind=$(classify "$value"); then

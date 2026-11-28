@@ -123,7 +123,84 @@ GIT_AUTHOR_NAME='web-flow' \
 head=$(git -C "$repo" rev-parse HEAD)
 "$gate" commits "$base" "$head" "$repo"
 
-# A retired name still fails when the email itself is a noreply address.
+# The operator's own identity is accepted in COMMIT METADATA: a merge commit
+# GitHub creates is authored with it, so a PR landing must not be refused for
+# that. Every other Gmail address above is still refused.
+repo=$work/operator
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+commit_as "$repo" 'Operator' "$(gmail "$(handle)")" 'Merge pull request #1 from anonb3ll/topic'
+head=$(git -C "$repo" rev-parse HEAD)
+if ! "$gate" commits "$base" "$head" "$repo"; then
+  fail 'operator identity in commit metadata was rejected'
+fi
+
+# The exemption is exact, so a look-alike that merely shares the handle, or a
+# +tag variant of the mailbox, is still refused. Without these two cases a
+# substring or prefix match would pass the suite.
+repo=$work/operator-lookalike
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+secret=$(gmail "not-$(handle)")
+commit_as "$repo" 'Operator' "$secret" 'look-alike author'
+sha=$(git -C "$repo" rev-parse HEAD)
+set +e
+output=$("$gate" commits "$base" "$sha" "$repo" 2>&1)
+code=$?
+set -e
+if [ "$code" -eq 0 ]; then
+  fail 'handle-prefix look-alike was accepted'
+fi
+
+repo=$work/operator-plustag
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+secret=$(gmail "$(handle)+work")
+commit_as "$repo" 'Operator' "$secret" '+tag author'
+sha=$(git -C "$repo" rev-parse HEAD)
+set +e
+output=$("$gate" commits "$base" "$sha" "$repo" 2>&1)
+code=$?
+set -e
+if [ "$code" -eq 0 ]; then
+  fail '+tag variant was accepted'
+fi
+
+# The trailer keeps refusing the operator address: a merge never adds one, so a
+# trailer claiming it is a fabricated co-author rather than a landing artifact.
+repo=$work/operator-trailer
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+secret=$(gmail "$(handle)")
+git -C "$repo" commit -q --allow-empty -m 'merge' -m "Co-authored-by: Operator <$secret>"
+sha=$(git -C "$repo" rev-parse HEAD)
+set +e
+output=$("$gate" commits "$base" "$sha" "$repo" 2>&1)
+code=$?
+set -e
+if [ "$code" -eq 0 ]; then
+  fail 'operator address in a Co-authored-by trailer was accepted'
+fi
+
+# The same identity is accepted as the committer as well, and the author may be
+# someone else - the allowance is per field, not per commit.
+repo=$work/operator-committer
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+GIT_AUTHOR_NAME='anonb3ll' \
+  GIT_AUTHOR_EMAIL='anonb3ll@pm.me' \
+  GIT_COMMITTER_NAME='Operator' \
+  GIT_COMMITTER_EMAIL="$(gmail "$(handle)")" \
+  git -C "$repo" commit -q --allow-empty -m 'committed by the operator'
+head=$(git -C "$repo" rev-parse HEAD)
+"$gate" commits "$base" "$head" "$repo" || fail 'operator committer was rejected'
+
+
 repo=$work/name
 new_repo "$repo"
 git -C "$repo" commit -q --allow-empty -m 'base'
@@ -185,6 +262,29 @@ code=$?
 set -e
 if [ "$code" -eq 0 ]; then
   fail 'separated name in a file was accepted'
+fi
+
+# The operator address is STILL a finding in tracked file content. The ruling
+# covers commit metadata; `files` mode did not change with it.
+repo=$work/operator-file
+new_repo "$repo"
+printf 'clean\n' >"$repo/README"
+git -C "$repo" add README
+git -C "$repo" commit -q -m 'clean'
+secret=$(gmail "$(handle)")
+printf 'see %s\n' "$secret" >"$repo/operator.txt"
+git -C "$repo" add operator.txt
+git -C "$repo" commit -q -m 'operator address in a file'
+set +e
+output=$("$gate" files "$repo" 2>&1)
+code=$?
+set -e
+if [ "$code" -eq 0 ]; then
+  fail 'operator address in a file was accepted'
+fi
+printf '%s\n' "$output" | grep -q 'operator.txt' || fail 'operator file address did not name the file'
+if printf '%s\n' "$output" | grep -qF -- "$secret"; then
+  fail 'operator file report printed the address'
 fi
 
 printf 'identity-gate-test: ok\n'
