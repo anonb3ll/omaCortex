@@ -136,8 +136,58 @@ if ! "$gate" commits "$base" "$head" "$repo"; then
   fail 'operator identity in commit metadata was rejected'
 fi
 
-# The same identity is still a finding when it is the committer and the author
-# differs, so the allowance is per-value and not per-commit.
+# The exemption is exact, so a look-alike that merely shares the handle, or a
+# +tag variant of the mailbox, is still refused. Without these two cases a
+# substring or prefix match would pass the suite.
+repo=$work/operator-lookalike
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+secret=$(gmail "not-$(handle)")
+commit_as "$repo" 'Operator' "$secret" 'look-alike author'
+sha=$(git -C "$repo" rev-parse HEAD)
+set +e
+output=$("$gate" commits "$base" "$sha" "$repo" 2>&1)
+code=$?
+set -e
+if [ "$code" -eq 0 ]; then
+  fail 'handle-prefix look-alike was accepted'
+fi
+
+repo=$work/operator-plustag
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+secret=$(gmail "$(handle)+work")
+commit_as "$repo" 'Operator' "$secret" '+tag author'
+sha=$(git -C "$repo" rev-parse HEAD)
+set +e
+output=$("$gate" commits "$base" "$sha" "$repo" 2>&1)
+code=$?
+set -e
+if [ "$code" -eq 0 ]; then
+  fail '+tag variant was accepted'
+fi
+
+# The trailer keeps refusing the operator address: a merge never adds one, so a
+# trailer claiming it is a fabricated co-author rather than a landing artifact.
+repo=$work/operator-trailer
+new_repo "$repo"
+git -C "$repo" commit -q --allow-empty -m 'base'
+base=$(git -C "$repo" rev-parse HEAD)
+secret=$(gmail "$(handle)")
+git -C "$repo" commit -q --allow-empty -m 'merge' -m "Co-authored-by: Operator <$secret>"
+sha=$(git -C "$repo" rev-parse HEAD)
+set +e
+output=$("$gate" commits "$base" "$sha" "$repo" 2>&1)
+code=$?
+set -e
+if [ "$code" -eq 0 ]; then
+  fail 'operator address in a Co-authored-by trailer was accepted'
+fi
+
+# The same identity is accepted as the committer as well, and the author may be
+# someone else - the allowance is per field, not per commit.
 repo=$work/operator-committer
 new_repo "$repo"
 git -C "$repo" commit -q --allow-empty -m 'base'

@@ -147,6 +147,23 @@ trailer_values() {
   printf '%s\n' "$body" | grep -i '^Co-authored-by:' || true
 }
 
+# One commit-metadata value: 0 when it is a finding, so the caller can count it.
+# The operator's own address is acceptable in the author and committer EMAIL
+# fields only (Anthony, 2026-11-27). Name fields keep the full rules, and
+# `files` mode never consults this at all.
+check_value() {
+  local sha=$1 kind=$2 value=$3 found
+  [ -n "$value" ] || return 0
+  if [ "$kind" = email ] && is_operator_identity "$value"; then
+    return 0
+  fi
+  if found=$(classify "$value"); then
+    printf 'identity-gate: %s %s\n' "$sha" "$found"
+    return 1
+  fi
+  return 0
+}
+
 check_commits() {
   local base=$1 head=$2 repo=$3
   local hits=0 sha name email cname cemail body value kind
@@ -165,13 +182,10 @@ check_commits() {
     cname=$(git -C "$repo" log -1 --format='%cn' "$sha")
     cemail=$(git -C "$repo" log -1 --format='%ce' "$sha")
     body=$(git -C "$repo" log -1 --format='%b' "$sha")
-    for value in "$name" "$email" "$cname" "$cemail"; do
-      is_operator_identity "$value" && continue
-      if kind=$(classify "$value"); then
-        printf 'identity-gate: %s %s\n' "$sha" "$kind"
-        hits=1
-      fi
-    done
+    check_value "$sha" name "$name" || hits=1
+    check_value "$sha" email "$email" || hits=1
+    check_value "$sha" name "$cname" || hits=1
+    check_value "$sha" email "$cemail" || hits=1
     while IFS= read -r value; do
       [ -n "$value" ] || continue
       if kind=$(classify "$value"); then
